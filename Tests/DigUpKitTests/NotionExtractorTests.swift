@@ -3,9 +3,16 @@ import XCTest
 
 final class NotionExtractorTests: XCTestCase {
 
+    /// Notion Desktop keeps its workspace at a different place on each system; the engine reads all three.
     func testDefaultDatabasePath() {
         let path = NotionExtractor.defaultDatabasePath
+        #if os(Windows)
+        XCTAssertTrue(path.hasSuffix("Notion/notion.db"))
+        #elseif os(Linux)
+        XCTAssertTrue(path.hasSuffix(".config/Notion/notion.db"))
+        #else
         XCTAssertTrue(path.hasSuffix("Library/Application Support/Notion/notion.db"))
+        #endif
     }
 
     func testNotionInstalledFlagMatchesFileSystem() {
