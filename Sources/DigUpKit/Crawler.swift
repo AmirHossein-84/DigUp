@@ -57,7 +57,10 @@ public enum Crawler {
         for input in roots {
             let path = FolderSelection.crawlPath(input.path)
             let root = URL(fileURLWithPath: path, isDirectory: true)
-            progress?(CrawlProgress(checked: checked, root: path))
+            // Progress names the root as it was chosen (`standardizedFileURL`); the walk reports real paths
+            // (/private/var where the root says /var), so it uses `path` instead.
+            let progressRoot = input.standardizedFileURL.path
+            progress?(CrawlProgress(checked: checked, root: progressRoot))
             lastUpdate = clock.now
             guard let context = chosen.filter({ path == $0 || FolderSelection.isInside(path, $0) })
                 .max(by: { $0.count < $1.count }) else { continue }
@@ -168,7 +171,7 @@ public enum Crawler {
                     checked += 1
                     let now = clock.now
                     if now - lastUpdate >= .milliseconds(250) {
-                        progress(CrawlProgress(checked: checked, root: root.path))
+                        progress(CrawlProgress(checked: checked, root: progressRoot))
                         lastUpdate = now
                     }
                 }

@@ -33,9 +33,10 @@ struct HanFilenameTests {
         try withStore { store in
             try add("學生情緒輔導紀錄.pdf", to: store)
             let content = try add("其他資料.pdf", to: store)
-            // A filename lookup must point at the file rather than a matching content page.
-            try store.db.run("INSERT INTO segments(file, kind, modality, loc) VALUES(?, 'page', 'none', 5)", [.int(content)])
-            try store.db.run("INSERT INTO fts(rowid, name, body) VALUES(?, '', '輔導')", [.int(store.db.lastInsertID)])
+            // A filename lookup must point at the file rather than a matching content page. Add the page through the
+            // store's own path, which stores Han body text as adjacent tokens (schema 6): a hand-written unspaced
+            // body would no longer match the split query phrase.
+            try store.addSegment(file: content, kind: .page, modality: .none, loc: 5, text: "輔導")
             try add("輔導.pdf", to: store)
             let hits = try Searcher(store: store).search("輔導", queryVector: nil)
             #expect(hits.map { ($0.path as NSString).lastPathComponent } == ["輔導.pdf", "學生情緒輔導紀錄.pdf", "其他資料.pdf"])
@@ -75,7 +76,11 @@ struct HanFilenameTests {
             try add("教育簡報.pdf", to: store)
             try add("category.pdf", to: store)
             let searcher = try Searcher(store: store)
-            #expect(try searcher.search("輔導", queryVector: nil).isEmpty)
+            // Schema 6 indexes folder names as body text, so the folder's words find the file: a keyword match that
+            // quotes the folder. It is not a Han filename match: that reads basenames only and leaves no excerpt.
+            let folder = try searcher.search("輔導", queryVector: nil)
+            #expect(folder.map(\.path) == ["/fixture/情緒輔導資料/別的檔案.pdf"])
+            #expect(folder.first?.excerpt?.contains("«輔導»") == true)
             #expect(try searcher.search("育簡", queryVector: nil).first?.path == "/fixture/教育簡報.pdf")
             #expect(try searcher.search("tegory", queryVector: nil).isEmpty)
         }

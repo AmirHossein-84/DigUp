@@ -75,8 +75,21 @@ extension DocExtractor {
 
 /// One entry of a zip file, as text.
 enum Zip {
+    /// The most a document's entry may declare. The indexer keeps at most 5,000 chunks of a document (about 9 M
+    /// characters), so 64 MB of XML is already far more than it can use.
+    static let maxEntryBytes: UInt64 = 64 << 20
+
     static func entry(_ name: String, in url: URL) throws -> String {
-        String(decoding: try ZipArchive(url).required(name), as: UTF8.self)
+        let archive = try ZipArchive(url)
+        // The entry's declared size first, before anything is allocated for it: a zip of a few KB can declare
+        // gigabytes, and extracting allocates the declared size whole.
+        guard let declared = try archive.declaredSize(of: name) else {
+            throw ExtractError.unreadable("no \(name) inside")
+        }
+        guard declared <= maxEntryBytes else {
+            throw ExtractError.unreadable("\(name) is \(declared >> 20) MB, more than is read")
+        }
+        return String(decoding: try archive.required(name), as: UTF8.self)
     }
 }
 
@@ -103,6 +116,18 @@ final class ZipArchive {
         if open { mz_zip_reader_end(zip) }   // miniz reads through `reader` until here
         zip.deinitialize(count: 1)
         zip.deallocate()
+    }
+
+    /// The entry's declared uncompressed size, or nil when the zip has no such entry. Read from the central
+    /// directory, so nothing is allocated for the entry yet.
+    func declaredSize(of name: String) throws -> UInt64? {
+        let index = mz_zip_reader_locate_file(zip, name, nil, 0)
+        guard index >= 0 else { return nil }
+        var stat = mz_zip_archive_file_stat()
+        guard mz_zip_reader_file_stat(zip, mz_uint(index), &stat) != 0 else {
+            throw ExtractError.unreadable("damaged zip file")
+        }
+        return stat.m_uncomp_size
     }
 
     /// The entry's bytes, or nil when the zip has no such entry.

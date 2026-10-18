@@ -37,14 +37,19 @@ import Testing
 
     @Test(arguments: [false, true], [false, true])
     func queuedSyncAllowsOneBatchPerPass(code: Bool, isNew: Bool) throws {
-        let part = try part(code: code, texts: ["The harbour opens today.", "A field guide to birds.",
-                                              "Notes from the meeting."])
+        // Documents go to the model a batch (16) at a time, code files one at a time: a pass takes one batch and
+        // yields to the queued sync, so a document pass leaves the files past the batch pending.
+        let texts = code ? ["The harbour opens today.", "A field guide to birds.", "Notes from the meeting."]
+            : Array(repeating: "The harbour opens today.", count: Indexer.documentBatchSize + 1)
+        let part = try part(code: code, texts: texts)
         let service = try service(part)
         let ids = Set(try part.store.pending(limit: nil).map(\.id))
         // Sync is queued from startup and stays queued until the service's next crawl.
-        for completed in 1...3 {
+        let batch = code ? 1 : Indexer.documentBatchSize
+        for pass in 1...((texts.count + batch - 1) / batch) {
             #expect(service.run(part, only: isNew ? ids : nil))
-            #expect(try part.store.pendingCount() == 3 - completed)
+            let completed = min(pass * batch, texts.count)
+            #expect(try part.store.pendingCount() == texts.count - completed)
             #expect(embedder.texts == completed)
         }
     }
@@ -81,13 +86,14 @@ import Testing
 
     @Test(arguments: ["stop", "backfill off"])
     func recoveryHonoursPauseAfterFirstBatch(command: String) throws {
-        let part = try part(texts: ["The harbour opens today.", "A field guide to birds.",
-                                   "Notes from the meeting."])
+        // The pause lands after the batch being embedded, not after its first file: documents go 16 at a time, so one
+        // batch of them is embedded and the one past it stays pending.
+        let part = try part(texts: Array(repeating: "The harbour opens today.", count: Indexer.documentBatchSize + 1))
         let service = try service(part)
         embedder.onTexts = { service.receive(command) }
         #expect(service.run(part, only: nil, yieldToSync: false))
-        #expect(try part.store.pendingCount() == 2)
-        #expect(embedder.texts == 1)
+        #expect(try part.store.pendingCount() == 1)
+        #expect(embedder.texts == Indexer.documentBatchSize)
     }
 
     @Test(arguments: [["--exclude", "/tmp/excluded"], ["--exclude-ext", "txt"]])
@@ -108,8 +114,9 @@ import Testing
         #expect(try part.store.pendingCount() == 2)
         #expect(embedder.texts == 0)
         #expect(service.run(part, only: ids))
-        #expect(try part.store.pendingCount() == 1)
-        #expect(embedder.texts == 1)
+        // New files go whatever the backfill says, one batch a pass: the two documents share a batch, code files don't.
+        #expect(try part.store.pendingCount() == (code ? 1 : 0))
+        #expect(embedder.texts == (code ? 1 : 2))
     }
 
     func longDocument() throws -> IndexService.Part {

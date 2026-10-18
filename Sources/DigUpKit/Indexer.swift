@@ -829,28 +829,43 @@ public final class Indexer {
         let wordPages = textPages.filter { SearchText.hasWords($0.text) }
         let imagePages = pages.filter { $0.imagePath != nil }
         let garbledPages = pages.filter { $0.garbled != nil }   // rendered too: among `imagePages`
-        var textVectors: [Int: [Float]] = [:]   // by page number
+        // A page is split against the complete prompt's token budget: its tail must reach the model too.
+        var textParts: [(page: Int, text: String)] = []
+        var textVectors: [Int: [Float]] = [:]   // by part, not page (a page can have several)
         var imageVectors: [Embedding] = []
+        var garbledParts: [(page: Int, text: String)] = []
         var garbledVectors: [[Float]] = []
         if !wordPages.isEmpty || !imagePages.isEmpty {
             let worker = try fullWorker()
-            let vectors = try worker.embedTexts(wordPages.map {
-                Prompts.document(title: title, text: String($0.text.prefix(4000)))
+            for page in textPages {
+                let parts = SearchText.hasWords(page.text)
+                    ? try worker.documentChunks(page.text, title: title) : [page.text]
+                textParts += parts.map { (page: page.number, text: $0) }
+            }
+            let worded = textParts.indices.filter { SearchText.hasWords(textParts[$0].text) }
+            let vectors = try worker.embedTexts(worded.map {
+                Prompts.document(title: title, text: textParts[$0].text)
             })
-            textVectors = Dictionary(uniqueKeysWithValues: zip(wordPages.map(\.number), vectors))
+            textVectors = Dictionary(uniqueKeysWithValues: zip(worded, vectors))
             imageVectors = try worker.embedImages(imagePages.compactMap(\.imagePath), budget: options.pageBudget)
-            garbledVectors = try worker.embedTexts(garbledPages.map {
-                Prompts.document(title: title, text: String($0.garbled!.prefix(4000)))
+            for page in garbledPages {
+                garbledParts += try worker.documentChunks(page.garbled!, title: title)
+                    .map { (page: page.number, text: $0) }
+            }
+            garbledVectors = try worker.embedTexts(garbledParts.map {
+                Prompts.document(title: title, text: $0.text)
             })
+        } else {
+            textParts = textPages.map { (page: $0.number, text: $0.text) }
         }
         try store.db.transaction {
             // Meaning only: the garbled words are never shown or matched against what you type.
-            for (page, vector) in zip(garbledPages, garbledVectors) {
-                try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(page.number), vector: vector)
+            for (part, vector) in zip(garbledParts, garbledVectors) {
+                try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(part.page), vector: vector)
             }
-            for page in textPages {
-                try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(page.number),
-                                     excerpt: excerpt(page.text), text: page.text, vector: textVectors[page.number])
+            for (index, part) in textParts.enumerated() {
+                try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(part.page),
+                                     excerpt: excerpt(part.text), text: part.text, vector: textVectors[index])
             }
             for (page, embedding) in zip(imagePages, imageVectors) {
                 try store.addSegment(file: file.id, kind: .pageImage, modality: .image, loc: Double(page.number),
@@ -874,28 +889,64 @@ public final class Indexer {
     /// Embeds chunks from multiple documents in one call, then commits each document independently.
     private func documents(_ batch: [FileRecord], documents: [Document], later: Bool,
                            results: inout [(String, String?)]) throws {
-        struct Target {
-            let slot: Int
+        /// A chunk split against the token budget: its text, and its place among the file's chunks.
+        struct Part {
             let chunk: Int
+            let text: String
+        }
+
+        // Split complete prompts against the runtime's real token budget before embedding: a chunk that doesn't fit
+        // would have its tail dropped (or be rejected). A file that can't fit at all (its title alone) fails on its
+        // own; a worker problem stops the run, as it does anywhere else.
+        let worker = documents.contains { $0.chunks.contains(where: SearchText.hasWords) } ? try fullWorker() : nil
+        var parts: [Int: [Part]] = [:]
+        var failed: [Int: String] = [:]
+        for document in documents {
+            let title = URL(fileURLWithPath: batch[document.slot].path).deletingPathExtension().lastPathComponent
+            var split: [Part] = []
+            do {
+                for (offset, chunk) in document.chunks.enumerated() {
+                    let texts = SearchText.hasWords(chunk)
+                        ? try worker!.documentChunks(chunk, title: title) : [chunk]
+                    split += texts.map { Part(chunk: offset, text: $0) }
+                }
+                parts[document.slot] = split
+            } catch let error as WorkerError {
+                throw error
+            } catch {
+                failed[document.slot] = "\(error)"
+            }
         }
 
         var prompts: [String] = []
-        var targets: [Target] = []
+        var targets: [(slot: Int, part: Int)] = []
         for document in documents {
+            guard let split = parts[document.slot] else { continue }
             let title = URL(fileURLWithPath: batch[document.slot].path).deletingPathExtension().lastPathComponent
-            for (offset, chunk) in document.chunks.enumerated() where SearchText.hasWords(chunk) {
-                prompts.append(Prompts.document(title: title, text: chunk))
-                targets.append(Target(slot: document.slot, chunk: offset))
+            for (index, part) in split.enumerated() where SearchText.hasWords(part.text) {
+                prompts.append(Prompts.document(title: title, text: part.text))
+                targets.append((slot: document.slot, part: index))
             }
         }
         let embedded = prompts.isEmpty ? [] : try fullWorker().embedTexts(prompts)
         var vectors: [Int: [Int: [Float]]] = [:]
         for (target, vector) in zip(targets, embedded) {
-            vectors[target.slot, default: [:]][target.chunk] = vector
+            vectors[target.slot, default: [:]][target.part] = vector
         }
 
         for document in documents {
             let file = batch[document.slot]
+            if let failure = failed[document.slot] {
+                // A long file that can't read on keeps what it has (`stopReading`); any other fails on its own.
+                if later {
+                    results[document.slot] = try stopReading(file, at: document.read.lowerBound, because: failure)
+                } else {
+                    try store.finish(file.id, state: "failed", detail: failure)
+                    results[document.slot] = ("failed", failure)
+                }
+                continue
+            }
+            let split = parts[document.slot] ?? []
             guard document.total > 0 else {
                 try store.finish(file.id, state: "skipped", detail: "no text")
                 results[document.slot] = ("skipped", "no text")
@@ -903,13 +954,14 @@ public final class Indexer {
             }
             let end = min(document.total, options.maxChunks)
             let unread = document.read.upperBound < end
-            let worded = document.chunks.filter(SearchText.hasWords).count
+            let worded = split.filter { SearchText.hasWords($0.text) }.count
             do {
                 try store.db.transaction {
-                    for (offset, chunk) in document.chunks.enumerated() {
+                    for (index, part) in split.enumerated() {
                         try store.addSegment(file: file.id, kind: .chunk, modality: .text,
-                                             loc: Double(document.read.lowerBound + offset + 1), excerpt: excerpt(chunk),
-                                             text: chunk, vector: vectors[document.slot]?[offset])
+                                             loc: Double(document.read.lowerBound + part.chunk + 1),
+                                             excerpt: excerpt(part.text), text: part.text,
+                                             vector: vectors[document.slot]?[index])
                     }
                     var info = later ? try store.info(of: file.id) : [:]
                     info["chunks"] = "\(end)"
@@ -923,8 +975,7 @@ public final class Indexer {
                 let span = later ? "chunks \(document.read.lowerBound + 1)–\(document.read.upperBound) of \(end)"
                     : unread ? "\(document.chunks.count) of \(end) chunks" : "\(document.chunks.count) chunks"
                 results[document.slot] = (unread ? "partial" : "done",
-                    span + (worded < document.chunks.count
-                            ? ", \(document.chunks.count - worded) for keywords only" : ""))
+                    span + (worded < split.count ? ", \(split.count - worded) for keywords only" : ""))
             } catch let error as WorkerError {
                 throw error
             } catch let error as IndexerError {
@@ -943,14 +994,39 @@ public final class Indexer {
             try store.finish(file.id, state: "skipped", detail: "no code")
             return ("skipped", "no code")
         }
+        // Keep the extractor's coarse code boundaries, then apply the complete prompt's real token budget. Preserve
+        // source offsets through this split: a result still opens at the line its words are on.
+        let worker = code.pieces.contains { SearchText.hasWords($0.text) } ? try fullWorker() : nil
+        var pieces: [CodeExtractor.Piece] = []
+        for piece in code.pieces {
+            guard SearchText.hasWords(piece.text), let worker = worker else {
+                pieces.append(piece)
+                continue
+            }
+            let ranges = try TextBudget.ranges(piece.text, title: code.title, limit: worker.textTokenLimit,
+                                               count: worker.textTokenCount)
+            var countedThrough = piece.text.startIndex, lineOffset = 0
+            for range in ranges {
+                let text = String(piece.text[range])
+                var first = piece.first, last = piece.last
+                if code.cells == nil {
+                    // Ranges advance even with overlap; count each source prefix only once.
+                    lineOffset += piece.text[countedThrough..<range.lowerBound].filter { $0 == "\n" || $0 == "\r\n" }.count
+                    countedThrough = range.lowerBound
+                    first += lineOffset
+                    last = first + text.dropLast().filter { $0 == "\n" || $0 == "\r\n" }.count
+                }
+                pieces.append(CodeExtractor.Piece(text: text, first: first, last: last))
+            }
+        }
         // Lines that are mostly numbers and symbols (a table of constants) get keyword search only.
-        let worded = code.pieces.indices.filter { SearchText.hasWords(code.pieces[$0].text) }
-        let vectors = worded.isEmpty ? [] : try fullWorker().embedTexts(worded.map {
-            Prompts.document(title: code.title, text: code.pieces[$0].text)
+        let worded = pieces.indices.filter { SearchText.hasWords(pieces[$0].text) }
+        let vectors = worded.isEmpty ? [] : try worker!.embedTexts(worded.map {
+            Prompts.document(title: code.title, text: pieces[$0].text)
         })
         let vector = Dictionary(uniqueKeysWithValues: zip(worded, vectors))
         try store.db.transaction {
-            for (offset, piece) in code.pieces.enumerated() {
+            for (offset, piece) in pieces.enumerated() {
                 try store.addSegment(file: file.id, kind: code.cells == nil ? .lines : .cells, modality: .text,
                                      loc: Double(piece.first), locEnd: Double(piece.last),
                                      excerpt: CodeExtractor.summary(piece.text), text: piece.text, vector: vector[offset])
@@ -960,8 +1036,8 @@ public final class Indexer {
             info["repo"] = code.repo
             try store.finish(file.id, state: "done", info: info)
         }
-        return ("done", "\(code.pieces.count) stretches, \(code.cells.map { "\($0) cells" } ?? "\(code.lines) lines")"
-                + (worded.count < code.pieces.count ? ", \(code.pieces.count - worded.count) for keywords only" : ""))
+        return ("done", "\(pieces.count) stretches, \(code.cells.map { "\($0) cells" } ?? "\(code.lines) lines")"
+                + (worded.count < pieces.count ? ", \(pieces.count - worded.count) for keywords only" : ""))
     }
 
     private func audio(_ file: FileRecord, pieces: [MediaPiece], duration: Double) throws -> (String, String?) {
