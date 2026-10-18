@@ -141,6 +141,8 @@ extension FileKind {
         case .audio: one ? L10n.text("audio file") : L10n.text("audio files")
         case .video: one ? L10n.text("video") : L10n.text("videos")
         case .code: one ? L10n.text("code file") : L10n.text("code files")
+        case .mail: one ? L10n.text("mail") : L10n.text("mails")
+        case .mailbox: one ? L10n.text("mailbox") : L10n.text("mailboxes")
         }
         return "\(count.formatted()) \(noun)"
     }

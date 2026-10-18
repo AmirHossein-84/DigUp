@@ -170,7 +170,7 @@ enum ResultGroupKind: CaseIterable {
         switch kind {
         case .screenshot: self = .screenshots
         case .image: self = .images
-        case .pdf, .doc: self = .documents
+        case .pdf, .doc, .mail, .mailbox: self = .documents
         case .video: self = .video
         case .audio: self = .audio
         case .code: self = .code
@@ -276,6 +276,8 @@ extension FileKind {
         case .audio: L10n.text("Audio")
         case .video: L10n.text("Video")
         case .code: L10n.text("Code")
+        case .mail: L10n.text("Mail")
+        case .mailbox: L10n.text("Mailbox")
         }
     }
 
@@ -288,6 +290,8 @@ extension FileKind {
         case .audio: "waveform"
         case .video: "film"
         case .code: "chevron.left.forwardslash.chevron.right"
+        case .mail: "envelope"
+        case .mailbox: "tray.full"
         }
     }
 }

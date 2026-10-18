@@ -119,7 +119,7 @@ import Testing
         for mail in waiting { try store.finish(mail.id, state: "skipped", detail: Mail.waiting, info: store.info(of: mail.id)) }
         #expect(try store.pendingCount() == 0)   // waiting isn't pending: nothing spins while Outlook has it
         let summary = try indexer.sync([files])   // the PST didn't change, but its mails wait: it's listed
-        #expect(Set(summary.queued) == Set(waiting.map { .id }))
+        #expect(Set(summary.queued) == Set(waiting.map { $0.id }))
         #expect(try indexer.run()["done"] == 3)
     }
 
