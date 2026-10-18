@@ -153,11 +153,13 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
                         && FileManager.default.fileExists(atPath: $0.path)
                 }
             } else {
+                // A mail's file is its PST (`Mail.file`). A PST itself isn't a result: its mails are.
                 hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast)
                     .filter {
-                        FolderSelection.isSearched($0.path, folders: roots, skipped: skipped)
-                            && !types.contains(($0.path as NSString).pathExtension.lowercased())
-                            && FileManager.default.fileExists(atPath: $0.path)
+                        let file = Mail.file(of: $0.path)
+                        return $0.kind != .mailbox && FolderSelection.isSearched(file, folders: roots, skipped: skipped)
+                            && !types.contains((file as NSString).pathExtension.lowercased())
+                            && FileManager.default.fileExists(atPath: file)
                     }
             }
             var reply: [String: Any] = [
@@ -171,8 +173,12 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             _ = vector(for: request["q"] as? String ?? "", code: request["code"] as? Bool ?? false)
             return ["ok": true]
         case "text":
-            guard let segment = (request["segment"] as? NSNumber)?.int64Value else { throw CLIError("which segment?") }
             let code = request["code"] as? Bool ?? false
+            // A file's first chunk: a mail's preview when it was found by its subject.
+            if let path = request["path"] as? String {
+                return ["text": try (code ? codeSearcher : searcher)?.firstText(ofFile: path) ?? NSNull()]
+            }
+            guard let segment = (request["segment"] as? NSNumber)?.int64Value else { throw CLIError("which segment?") }
             return ["text": try (code ? codeSearcher : searcher)?.text(ofSegment: segment) ?? NSNull()]
         case "reload":
             let hadVectors = searcher.vectorsLoaded
