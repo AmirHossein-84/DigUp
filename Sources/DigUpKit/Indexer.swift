@@ -120,7 +120,7 @@ public final class Indexer {
             }
         } ?? roots
         let crawl = Crawler.crawl(walkRoots, options: options, chosenRoots: roots, progress: progress)
-        let pathsToReconcile = scopes?.map(\.path) ?? roots.map(\.path)
+        let pathsToReconcile = scopes?.map { $0.path } ?? roots.map { $0.path }
         guard !pathsToReconcile.isEmpty else { return SyncSummary(crawl: crawl) }
         let existing = try store.files(under: pathsToReconcile)
         var byPath: [String: FileRecord] = [:]
@@ -129,7 +129,7 @@ public final class Indexer {
             byPath[file.path] = file
             byInode["\(file.device):\(file.inode)"] = file
         }
-        let seen = Set(crawl.candidates.map(\.path))
+        let seen = Set(crawl.candidates.map { $0.path })
         var movedFrom = Set<String>()
         var summary = SyncSummary(crawl: crawl)
         try store.db.transaction {
@@ -154,7 +154,7 @@ public final class Indexer {
             }
             // A root that went away while it was being walked (a drive ejected mid-crawl) looked emptier than it is:
             // keep its rows rather than take that for "deleted".
-            let vanished = roots.map(\.path)
+            let vanished = roots.map { $0.path }
                 .filter { !FileManager.default.fileExists(atPath: $0) }.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
             for row in existing where !seen.contains(row.path) && !movedFrom.contains(row.path)
                 && !vanished.contains(where: { row.path.hasPrefix($0) }) {

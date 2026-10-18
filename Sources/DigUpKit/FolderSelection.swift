@@ -143,4 +143,25 @@ public struct FolderSelection: Equatable, Sendable {
         var seen = Set<String>()
         return paths.filter { seen.insert($0).inserted }
     }
+
+    /// The crawl's spelling, even for a deleted path: resolve its closest surviving ancestor first.
+    public static func crawlPath(_ path: String) -> String {
+        #if os(Windows)
+        var path = URL(fileURLWithPath: path).standardizedFileURL.path
+        if path.hasPrefix("/"), path.count >= 3 {
+            let second = path.index(after: path.startIndex)
+            let third = path.index(after: second)
+            if path[second].isASCII && path[second].isLetter && path[third] == ":" {
+                path.removeFirst()
+            }
+        }
+        #else
+        let path = URL(fileURLWithPath: path).standardizedFileURL.path
+        #endif
+        if FileManager.default.fileExists(atPath: path) { return realPath(path) }
+        let parent = Self.parent(path)
+        guard parent != path, !parent.isEmpty else { return path }
+        let realParent = crawlPath(parent)
+        return realParent + (realParent.hasSuffix("/") ? "" : "/") + (path as NSString).lastPathComponent
+    }
 }

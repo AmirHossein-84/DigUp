@@ -52,6 +52,15 @@ public enum NotionExtractor {
     /// Block types that are page boundaries: traversed for breadcrumbs but not added as body text.
     private static let pageTypes: Set<String> = ["page", "collection_view_page", "personal_home_page"]
 
+    private struct RawBlock {
+        let id: String
+        let type: String
+        let parentID: String?
+        let parentTable: String?
+        let title: String
+        let lastEdited: Double
+    }
+
     // MARK: - Public API
 
     /// Extracts active pages from Notion's local SQLite database in read-only mode.
@@ -152,15 +161,6 @@ public enum NotionExtractor {
             throw ExtractError.unreadable("Failed to prepare statement: \(String(cString: sqlite3_errmsg(db)))")
         }
         defer { sqlite3_finalize(statement) }
-
-        struct RawBlock {
-            let id: String
-            let type: String
-            let parentID: String?
-            let parentTable: String?
-            let title: String
-            let lastEdited: Double
-        }
 
         var blockMap: [String: RawBlock] = [:]
         var childrenOf: [String: [String]] = [:]

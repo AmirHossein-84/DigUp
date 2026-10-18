@@ -296,7 +296,6 @@ public final class IndexStore {
 
     /// The file changed on disk: drop what was extracted from it and queue it again.
     public func requeue(_ id: Int64, as file: Candidate) throws {
-        let path = file.path.precomposedStringWithCanonicalMapping
         try db.transaction {
             try deleteSegments(of: id, keepingName: true)
             try db.run("""
