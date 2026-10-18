@@ -42,7 +42,9 @@ enum ParentWatch {
         guard let handle = OpenProcess(DWORD(SYNCHRONIZE), false, pid), handle != INVALID_HANDLE_VALUE else {
             _exit(0)
         }
+        let handleValue = UInt(bitPattern: handle)
         Thread.detachNewThread {
+            guard let handle = HANDLE(bitPattern: handleValue) else { _exit(0) }
             defer { CloseHandle(handle) }
             WaitForSingleObject(handle, INFINITE)
             _exit(0)
