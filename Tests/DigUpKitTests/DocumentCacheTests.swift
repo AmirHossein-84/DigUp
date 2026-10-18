@@ -19,13 +19,13 @@ import Testing
             let output = folder.appendingPathComponent("step-\(step.lowerBound)")
             let prepared = Indexer.prepare(Indexer.Job(files: [file], step: step), options: IndexOptions(),
                                            into: output, documents: cache)
-            guard case .doc(let chunks, let read, let total, let characters) = prepared.payload else {
+            guard case .documents(let docs) = prepared.payload, let doc = docs.first else {
                 Issue.record("document extraction failed"); return
             }
-            #expect(read == step)
-            #expect(chunks == Array(document.chunks[step]))
-            #expect(total == document.chunks.count)
-            #expect(characters == text.count)
+            #expect(doc.read == step)
+            #expect(doc.chunks == Array(document.chunks[step]))
+            #expect(doc.total == document.chunks.count)
+            #expect(doc.characters == text.count)
         }
         #expect(try cache.read(url, limit: 1).chunks.count == 1)
         try "replacement".write(to: url, atomically: true, encoding: .utf8)
