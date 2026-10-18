@@ -8,8 +8,11 @@ import UniformTypeIdentifiers
 
 extension Rules {
     public static func classify(_ url: URL, type: UTType?, options: IndexOptions) -> Classification {
+        // Before type sniffing or any content reads, in every indexing mode.
+        if isSecret(url.lastPathComponent) { return .skip("key or password file") }
         let ext = url.pathExtension.lowercased()
         if options.excludedExtensions.contains(ext) { return .skip("excluded type") }
+        if protectedExtensions.contains(ext) { return .skip("copy-protected") }
         // .ts / .mts are usually TypeScript, which Spotlight calls MPEG-2 video. Only a real transport stream is video.
         if ext == "ts" || ext == "mts" || ext == "m2ts" {
             if isMPEGTransportStream(url) { return .index(.video) }
@@ -40,18 +43,15 @@ extension Rules {
 }
 
 enum FileSystem {
-    /// What the crawl asks of each URL.
-    static let crawlKeys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentTypeKey, .isUbiquitousItemKey,
-                                              .ubiquitousItemDownloadingStatusKey]
+    /// What the crawl asks of each URL. Not iCloud's download status: in a File Provider folder (iCloud Drive, Google
+    /// Drive, OneDrive…) that's a round trip to the provider for every entry, about 1.2 ms against 0.02 ms without, which
+    /// made a sync over a few hundred thousand entries take ten minutes. A file that isn't downloaded is `dataless`
+    /// (`info`) on every macOS DigUp runs on.
+    static let crawlKeys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentTypeKey]
 
     /// An app, a framework, a library bundle: one thing to the Finder, skipped whole.
     static func isPackage(_ url: URL, _ values: URLResourceValues?) -> Bool {
         values?.isPackage == true
-    }
-
-    /// An iCloud file that isn't downloaded (reading it would download it).
-    static func isInCloud(_ values: URLResourceValues?) -> Bool {
-        values?.isUbiquitousItem == true && values?.ubiquitousItemDownloadingStatus != .current
     }
 
     /// The file's own facts, without following a link. `dataless`: a placeholder ("Optimize Mac Storage", File Providers)

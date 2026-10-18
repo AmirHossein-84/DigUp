@@ -30,9 +30,11 @@ public struct FolderSelection: Equatable, Sendable {
     }
 
     public static func isSearched(_ path: String, folders: [String], skipped: [String]) -> Bool {
-        folders.contains { folder in
-            (path == folder || isInside(path, folder))
-                && !skipped.contains { skip in isInside(skip, folder) && (path == skip || isInside(path, skip)) }
+        let p = normalizePath(path)
+        return folders.contains { folder in
+            let f = normalizePath(folder)
+            return (p == f || isInside(path, folder))
+                && !skipped.contains { skip in isInside(skip, folder) && (p == normalizePath(skip) || isInside(path, skip)) }
         }
     }
 
@@ -92,8 +94,26 @@ public struct FolderSelection: Equatable, Sendable {
         skipped.removeAll { $0 == folder }
     }
 
+    private static func normalizePath(_ path: String) -> String {
+        var p = path.replacingOccurrences(of: "\\", with: "/")
+        #if os(Windows)
+        if p.hasPrefix("/"), p.count >= 3 {
+            let second = p.index(after: p.startIndex)
+            let third = p.index(after: second)
+            if p[second].isASCII && p[second].isLetter && p[third] == ":" {
+                p.removeFirst()
+            }
+        }
+        return p.lowercased()
+        #else
+        return p
+        #endif
+    }
+
     public static func isInside(_ path: String, _ folder: String) -> Bool {
-        path.hasPrefix(folder.hasSuffix("/") ? folder : folder + "/")
+        let p = normalizePath(path)
+        let f = normalizePath(folder)
+        return p.hasPrefix(f.hasSuffix("/") ? f : f + "/")
     }
 
     public static func parent(_ path: String) -> String {
@@ -103,7 +123,15 @@ public struct FolderSelection: Equatable, Sendable {
     /// The path as a walk of the folder reports it (/private/var where `standardizedFileURL` says /var).
     public static func realPath(_ path: String) -> String {
         #if os(Windows)
-        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        var p = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        if p.hasPrefix("/"), p.count >= 3 {
+            let second = p.index(after: p.startIndex)
+            let third = p.index(after: second)
+            if p[second].isASCII && p[second].isLetter && p[third] == ":" {
+                p.removeFirst()
+            }
+        }
+        return p
         #else
         guard let real = realpath(path, nil) else { return path }
         defer { free(real) }

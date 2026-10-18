@@ -1,3 +1,4 @@
+import DigUpLocalization
 import AppKit
 import DigUpKit
 import Observation
@@ -54,6 +55,8 @@ final class SearchPanelController {
     /// The generation whose final (meaning) results are showing; late keyword results must not replace them.
     @ObservationIgnored private var finalGeneration = -1
     @ObservationIgnored private var meaningTask: Task<Void, Never>?
+    /// The apps the query names: the first group, whatever the index finds.
+    @ObservationIgnored private var apps: [ResultRow] = []
     @ObservationIgnored private var keyMonitor: Any?
     @ObservationIgnored private var mouseMonitor: Any?
     @ObservationIgnored private var resignObserver: NSObjectProtocol?
@@ -75,11 +78,12 @@ final class SearchPanelController {
         self.app = app
         model = app.model
         engine = app.engine
+        AppLauncher.shared.refresh()
     }
 
     var isVisible: Bool { window?.isVisible == true && !fading }
     var windowNumber: Int { window?.windowNumber ?? 0 }
-    var isPreviewing: Bool { QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible }
+    var isPreviewing: Bool { QuickLookController.isShowing }
     /// The selectable rows in order: strong results group by group, the fold, then the weaker ones if unfolded.
     var rowIDs: [String] {
         results.groups.flatMap { $0.rows.map(\.id) }
@@ -99,6 +103,7 @@ final class SearchPanelController {
         let started = Date()
         shownAt = started
         engine.prewarm()
+        AppLauncher.shared.refresh()
         let window = self.window ?? makeWindow()
         placeWindow(window)
         if AppController.offscreen { return }
@@ -121,7 +126,7 @@ final class SearchPanelController {
         installKeyMonitor()
         if activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
-                                                             reason: "Search panel open")
+                                                             reason: L10n.text("Search panel open"))
         }
         let shown = Date()
         DispatchQueue.main.async {
@@ -131,9 +136,7 @@ final class SearchPanelController {
     }
 
     func hide() {
-        if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
-            QLPreviewPanel.shared().orderOut(nil)
-        }
+        QuickLookController.hide()
         removeKeyMonitor()
         PreviewPlayback.shared.stop()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
@@ -168,7 +171,7 @@ final class SearchPanelController {
         let codeText = CodeQuery.text(of: typed)
         isCode = codeText != nil
         let code = isCode
-        let text = codeText ?? typed
+        apps = []
         guard !typed.isEmpty else {
             results = .empty
             selection = nil
@@ -184,6 +187,12 @@ final class SearchPanelController {
             resizeWindow()
             return
         }
+        // Apps by their names, now: ↩ launches the top one even before the index answers.
+        apps = code ? [] : AppLauncher.shared.matches(typed)
+        results = results.withApps(apps)
+        selection = rowIDs.first
+        if phase == .empty, !apps.isEmpty { phase = .words }
+        resizeWindow()
         // Words now. The last word is probably half-typed, so it matches as a prefix.
         Task {
             let started = Date()
@@ -223,6 +232,7 @@ final class SearchPanelController {
     private func show(_ hits: [SearchHit], query: String, phase: SearchPhase) {
         // Code is one group: it gets the room of all of them.
         results = ResultSet(hits, query: query, rowsPerGroup: isCode ? Self.rowsPerGroup * 3 : Self.rowsPerGroup)
+            .withApps(apps)
         if !navigated { showWeaker = false }
         // Follow the top hit until you pick something with the arrow keys.
         if !navigated || !rowIDs.contains(where: { $0 == selection }) {
@@ -230,7 +240,16 @@ final class SearchPanelController {
         }
         self.phase = phase
         resizeWindow()
-        if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible { updateQuickLook() }
+        if QuickLookController.isShowing { updateQuickLook() }
+    }
+
+    /// The apps were read again and some came or went: the query's apps again.
+    func appsChanged() {
+        let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty, !isCode else { return }
+        apps = AppLauncher.shared.matches(typed)
+        results = results.withApps(apps)
+        if !navigated || !rowIDs.contains(where: { $0 == selection }) { selection = rowIDs.first }
     }
 
     func toggleWeaker() {
@@ -296,20 +315,19 @@ final class SearchPanelController {
     /// True when the key was handled here (it then doesn't reach the search field).
     private func handle(_ event: NSEvent) -> Bool {
         // An input method is composing (Japanese, Chinese…): ↩, the arrows and Esc are its keys until it's done.
-        if (field?.currentEditor() as? NSTextView)?.hasMarkedText() == true { return false }
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            .subtracting([.capsLock, .numericPad, .function])
-        let previewing = QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
-        switch event.keyCode {
-        case 53:  // Esc
-            if previewing { QLPreviewPanel.shared().orderOut(nil) } else { dismiss() }
+        guard let press = KeyCommands.press(event, field: field) else { return false }
+        let modifiers = press.modifiers
+        let previewing = QuickLookController.isShowing
+        switch press.keyCode {
+        case KeyCommands.escape:  // Esc
+            if previewing { QuickLookController.hide() } else { dismiss() }
             return true
-        case 125, 126:  // ↓ ↑
+        case KeyCommands.downArrow, KeyCommands.upArrow:  // ↓ ↑
             guard modifiers.isEmpty else { return false }
-            moveSelection(by: event.keyCode == 125 ? 1 : -1)
+            moveSelection(by: press.keyCode == KeyCommands.downArrow ? 1 : -1)
             navigated = true
             return true
-        case 36, 76:  // ↩, enter
+        case KeyCommands.enter, KeyCommands.keypadEnter:  // ↩, enter
             if selection == Self.weakerToggle, modifiers.isEmpty {
                 toggleWeaker()
             } else if modifiers == .command {
@@ -320,16 +338,16 @@ final class SearchPanelController {
                 return false
             }
             return true
-        case 49 where modifiers.isEmpty && (navigated || previewing) && selection != nil:  // Space
+        case KeyCommands.space where modifiers.isEmpty && (navigated || previewing) && selection != nil:  // Space
             if selection == Self.weakerToggle { toggleWeaker() } else { toggleQuickLook() }
             return true
-        case 16 where modifiers == .command:  // ⌘Y
+        case KeyCommands.y where modifiers == .command:  // ⌘Y
             toggleQuickLook()
             return true
-        case 31 where modifiers == .command:  // ⌘O: the same search in the window, for a bigger look
+        case KeyCommands.o where modifiers == .command:  // ⌘O: the same search in the window, for a bigger look
             openInWindow()
             return true
-        case 8 where modifiers == .command:
+        case KeyCommands.c where modifiers == .command:
             // ⌘C copies the selected file, except right after you selected some of the query text (the panel opens
             // with the last query selected, and arrowing to a result means you want the file).
             let textSelected = (field?.currentEditor()?.selectedRange.length ?? 0) > 0
@@ -346,7 +364,7 @@ final class SearchPanelController {
         guard !ids.isEmpty else { return }
         let index = selection.flatMap { ids.firstIndex(of: $0) } ?? -1
         selection = ids[max(0, min(ids.count - 1, index + step))]
-        if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible { updateQuickLook() }
+        if QuickLookController.isShowing { updateQuickLook() }
     }
 
     func select(_ row: ResultRow) {
@@ -374,7 +392,7 @@ final class SearchPanelController {
         pasteboard.clearContents()
         // As a file, like ⌘C in Finder: paste into a folder, a chat or a mail.
         pasteboard.writeObjects([row.url as NSURL])
-        flash("Copied \(row.name)")
+        flash(L10n.format("Copied %1$@", String(describing: row.name)))
     }
 
     /// The search window, with this query (and only one kind, if given): for a bigger look.
@@ -422,20 +440,12 @@ final class SearchPanelController {
     // MARK: Quick Look
 
     func toggleQuickLook() {
-        let panel = QLPreviewPanel.shared()!
-        if QLPreviewPanel.sharedPreviewPanelExists(), panel.isVisible {
-            panel.orderOut(nil)
-        } else if selectedRow != nil {
-            updateQuickLook()
-            panel.makeKeyAndOrderFront(nil)
-        }
+        QuickLookController.toggle(on: window, row: selectedRow)
     }
 
     /// Quick Look shows the selected result at its page or moment.
     private func updateQuickLook() {
-        window?.previewURL = selectedRow?.url
-        QLPreviewPanel.shared().reloadData()
-        QuickLookMoment.show(selectedRow, in: QLPreviewPanel.shared())
+        QuickLookController.update(on: window, row: selectedRow)
     }
 
     // MARK: Window
@@ -512,7 +522,7 @@ final class SearchPanelController {
 }
 
 /// The floating panel. Unlike most floating panels it becomes key, because you type into it.
-final class SearchPanelWindow: NSPanel, QLPreviewPanelDataSource {
+final class SearchPanelWindow: NSPanel, QLPreviewPanelDataSource, QuickLookHost {
     /// What Space / ⌘Y previews.
     var previewURL: URL?
 
@@ -553,10 +563,10 @@ final class SearchPanelWindow: NSPanel, QLPreviewPanelDataSource {
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        previewURL == nil ? 0 : 1
+        QuickLookController.itemCount(for: previewURL)
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
-        previewURL as NSURL?
+        QuickLookController.item(for: previewURL)
     }
 }

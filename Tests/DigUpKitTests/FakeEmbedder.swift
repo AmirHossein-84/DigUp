@@ -6,6 +6,9 @@ final class FakeEmbedder: Embedder {
     let info = WorkerInfo(model: "fake", revision: "0000000", runtime: "test", dtype: "f32", dim: Vectors.dimension,
                           textOnly: false, loadSeconds: nil)
     private(set) var texts = 0
+    private(set) var textCalls = 0
+    private(set) var textBatches: [[String]] = []
+    private(set) var textInputs: [String] = []
 
     static func vector(for text: String) -> [Float] {
         var state = UInt64(5381)
@@ -21,6 +24,9 @@ final class FakeEmbedder: Embedder {
 
     func embedTexts(_ texts: [String]) throws -> [[Float]] {
         self.texts += texts.count
+        textCalls += 1
+        textBatches.append(texts)
+        textInputs += texts
         return texts.map(Self.vector(for:))
     }
 

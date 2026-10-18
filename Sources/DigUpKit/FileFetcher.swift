@@ -29,6 +29,7 @@ public final class FileFetcher: NSObject, URLSessionDataDelegate, @unchecked Sen
     // holds, and with some libcurl builds (Debian 13's, Ubuntu 26.04's) Foundation's handler for that runs after the
     // session's curl handle is gone: "_MultiHandle deallocated with non-zero retain count", then an abort.
     nonisolated(unsafe) private static var sessions: [URLSession] = []
+    nonisolated(unsafe) private static var finished: [URLSession] = []
     private static let sessionsLock = NSLock()
     #endif
 
@@ -143,7 +144,15 @@ public final class FileFetcher: NSObject, URLSessionDataDelegate, @unchecked Sen
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         try? handle?.close()
         handle = nil
+        #if canImport(FoundationNetworking)
+        // swift-corelibs-foundation: invalidating (and freeing) a session from inside its own delegate callback
+        // frees its curl multi handle while still in use ("_MultiHandle deallocated with non-zero retain count").
+        // Keep it alive and let it go once this callback has returned.
+        Self.sessionsLock.withLock { Self.finished.append(session) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { session.finishTasksAndInvalidate() }
+        #else
         session.finishTasksAndInvalidate()
+        #endif
         progress(written)
         if let problem {
             done(.failed(problem.message, retry: problem.retry))

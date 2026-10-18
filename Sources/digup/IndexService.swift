@@ -48,6 +48,8 @@ final class IndexService: @unchecked Sendable {
     private let modelReady: () -> Bool
     private let newFilesLimit: Int
     private let linger: Double
+    private let resumePending: Bool
+    private var hours: IndexingHours?
 
     private let lock = NSLock()
     private var syncRequested = true       // the first thing it does
@@ -60,16 +62,19 @@ final class IndexService: @unchecked Sendable {
     private var yieldAt = Date.distantPast
     private let wake = DispatchSemaphore(value: 0)
 
-    init(main: Part, code: Part?, folder: URL, model: SharedEmbedder, modelReady: @escaping () -> Bool,
-         backfill: Bool, newFilesLimit: Int, linger: Double) {
+    init(main: Part, code: Part?, folder: URL? = nil, model: SharedEmbedder, modelReady: @escaping () -> Bool,
+         backfill: Bool, newFilesLimit: Int, linger: Double, resumePending: Bool = false,
+         hours: IndexingHours? = nil) {
         self.main = main
         self.code = code
-        self.folder = folder
+        self.folder = folder ?? main.store.file.deletingLastPathComponent()
         self.model = model
         self.modelReady = modelReady
         self.backfillAllowed = backfill
         self.newFilesLimit = newFilesLimit
         self.linger = linger
+        self.resumePending = resumePending
+        self.hours = hours
     }
 
     private var parts: [Part] { [main] + (code.map { [$0] } ?? []) }
@@ -99,9 +104,20 @@ final class IndexService: @unchecked Sendable {
             return 1
         }
         Thread.detachNewThread { [self] in readCommands() }
+        if resumePending, modelReady(), lock.withLock({ backfillAllowed && (hours?.isOpen(at: Date()) ?? true) }) {
+            // shortcut: resume an already reconciled queue once; normal sync follows to discover later changes.
+            _ = availableRoots(main)
+            emitCounts("idle")
+            guard run(main, only: nil, yieldToSync: false) else {
+                finish()
+                emit(["event": "exit"])
+                return 1
+            }
+        }
         var newFiles = Set<Int64>(), newCode = Set<Int64>()
         var codeCounted = code == nil
         while true {
+            if lock.withLock({ stopRequested }) { break }
             if lock.withLock({ () -> Bool in defer { syncRequested = false }; return syncRequested }) {
                 sync(main, into: &newFiles)
             }
@@ -119,18 +135,19 @@ final class IndexService: @unchecked Sendable {
                 emitCounts("waiting", ["for": "model"])
                 break
             }
+            let isHoursOpen = lock.withLock { hours?.isOpen(at: Date()) ?? true }
             if !newFiles.isEmpty {
                 guard run(main, only: newFiles) else { break }
                 newFiles = left(main, of: newFiles)
                 continue
             }
-            if (try? main.store.pendingCount()) ?? 0 > 0, lock.withLock({ backfillAllowed }) {
+            if (try? main.store.pendingCount()) ?? 0 > 0, lock.withLock({ backfillAllowed }) && isHoursOpen {
                 guard run(main, only: nil) else { break }
                 if lock.withLock({ syncRequested }) { continue }
             }
             // The code index once the main one has nothing waiting: its own sync (code changes come in a while after
             // they settle), what it just queued at once, the rest under the backfill's rules.
-            if let code, (try? main.store.pendingCount()) ?? 1 == 0 || !lock.withLock({ backfillAllowed }) {
+            if let code, (try? main.store.pendingCount()) ?? 1 == 0 || !lock.withLock({ backfillAllowed }) || !isHoursOpen {
                 if lock.withLock({ () -> Bool in defer { codeSyncRequested = false }; return codeSyncRequested }) {
                     sync(code, into: &newCode)
                 }
@@ -139,19 +156,19 @@ final class IndexService: @unchecked Sendable {
                     newCode = left(code, of: newCode)
                     continue
                 }
-                if (try? code.store.pendingCount()) ?? 0 > 0, lock.withLock({ backfillAllowed }) {
+                if (try? code.store.pendingCount()) ?? 0 > 0, lock.withLock({ backfillAllowed }) && isHoursOpen {
                     guard run(code, only: nil) else { break }
                     if lock.withLock({ syncRequested || codeSyncRequested }) { continue }
                 }
             }
             // Once nothing is waiting: the rest of long PDFs and documents, the same way.
-            if lock.withLock({ backfillAllowed }), (try? main.store.pendingCount()) ?? 1 == 0,
+            if lock.withLock({ backfillAllowed }) && isHoursOpen, (try? main.store.pendingCount()) ?? 1 == 0,
                (try? code?.store.pendingCount() ?? 0) ?? 1 == 0, (try? main.store.unfinishedCount().files) ?? 0 > 0 {
                 guard finishLongFiles() else { break }
                 if lock.withLock({ syncRequested || codeSyncRequested }) { continue }
             }
             if code != nil, lock.withLock({ codeSyncRequested }) { continue }
-            emitCounts("idle")
+            emitCounts(isHoursOpen ? "idle" : "waiting", isHoursOpen ? [:] : ["for": "hours"])
             // Nothing warm to keep around: leave now. Else wait a little for more work.
             guard model.isRunning, waitForWork() else { break }
         }
@@ -232,16 +249,19 @@ final class IndexService: @unchecked Sendable {
 
     /// Embeds a part's pending files (`only` some). False when indexing has to stop (the worker died, or the index was
     /// built with other settings).
-    private func run(_ part: Part, only ids: Set<Int64>?) -> Bool {
+    func run(_ part: Part, only ids: Set<Int64>?, yieldToSync: Bool = true) -> Bool {
         let started = Date()
         let isNew = ids != nil
+        var madeProgress = false
         do {
             let states = try part.indexer.run(only: ids, shouldStop: { [self] in
                 lock.withLock {
-                    stopRequested || (!isNew && !backfillAllowed)
-                        || Date() >= yieldAt && (syncRequested || part.code && codeSyncRequested)
+                    let hoursOpen = hours?.isOpen(at: Date()) ?? true
+                    return stopRequested || (!isNew && (!backfillAllowed || !hoursOpen))
+                        || (yieldToSync && madeProgress && Date() >= yieldAt && (syncRequested || (part.code && codeSyncRequested)))
                 }
             }, onEvent: { event in
+                madeProgress = true
                 emit(["event": "file", "new": isNew, "done": event.done, "total": event.total, "path": event.path,
                       "kind": event.kind.rawValue, "state": event.state, "seconds": event.seconds,
                       "note": event.note ?? "", "code": part.code])
@@ -259,15 +279,18 @@ final class IndexService: @unchecked Sendable {
 
     /// The rest of long files (`Indexer.finishLongFiles`), yielding as the backfill does. False when indexing has to
     /// stop.
-    private func finishLongFiles() -> Bool {
+    func finishLongFiles() -> Bool {
         let started = Date()
+        var madeProgress = false
         do {
             let states = try main.indexer.finishLongFiles(shouldStop: { [self] in
                 lock.withLock {
-                    stopRequested || !backfillAllowed
-                        || Date() >= yieldAt && (syncRequested || codeSyncRequested && code != nil)
+                    let hoursOpen = hours?.isOpen(at: Date()) ?? true
+                    return stopRequested || !backfillAllowed || !hoursOpen
+                        || (madeProgress && Date() >= yieldAt && (syncRequested || (codeSyncRequested && code != nil)))
                 }
             }, onStep: { step in
+                madeProgress = true
                 emit(["event": "rest", "done": step.done, "total": step.total, "files": step.files, "path": step.path,
                       "kind": step.kind.rawValue, "state": step.state, "seconds": step.seconds, "note": step.note ?? ""])
             })
@@ -284,14 +307,20 @@ final class IndexService: @unchecked Sendable {
 
     /// Waits up to `linger` seconds for something to do. False: time's up, or told to stop.
     private func waitForWork() -> Bool {
-        let deadline = DispatchTime.now() + linger
+        let deadline: DispatchTime
+        if let next = lock.withLock({ hours?.nextChange(after: Date()) }) {
+            let waitSeconds = max(0, min(linger, next.timeIntervalSinceNow + 1))
+            deadline = DispatchTime.now() + waitSeconds
+        } else {
+            deadline = DispatchTime.now() + linger
+        }
         while wake.wait(timeout: deadline) == .success {
-            let (sync, codeSync, stop, backfill) = lock.withLock {
-                (syncRequested, codeSyncRequested, stopRequested, backfillAllowed)
+            let (sync, codeSync, stop, backfill, hoursOpen) = lock.withLock {
+                (syncRequested, codeSyncRequested, stopRequested, backfillAllowed, hours?.isOpen(at: Date()) ?? true)
             }
             if stop { return false }
             if sync || codeSync && code != nil { return true }
-            if backfill, parts.contains(where: { (try? $0.store.pendingCount()) ?? 0 > 0 })
+            if backfill && hoursOpen, parts.contains(where: { (try? $0.store.pendingCount()) ?? 0 > 0 })
                 || (try? main.store.unfinishedCount().files) ?? 0 > 0 {
                 return true
             }
@@ -301,19 +330,31 @@ final class IndexService: @unchecked Sendable {
 
     private func readCommands() {
         while let line = readLine() {
-            lock.withLock {
-                switch line.trimmingCharacters(in: .whitespaces) {
-                case "sync": syncRequested = true
-                case "sync code": codeSyncRequested = true
-                case "stop": stopRequested = true
-                case "backfill on": backfillAllowed = true
-                case "backfill off": backfillAllowed = false
-                default: break
-                }
-            }
-            wake.signal()
+            receive(line)
         }
         lock.withLock { stopRequested = true }   // the app went away
+        wake.signal()
+    }
+
+    func receive(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        lock.withLock {
+            switch trimmed {
+            case "sync": syncRequested = true
+            case "sync code": codeSyncRequested = true
+            case "stop": stopRequested = true
+            case "backfill on": backfillAllowed = true
+            case "backfill off": backfillAllowed = false
+            case "hours off": hours = nil
+            case let cmd where cmd.hasPrefix("hours on "):
+                let arg = String(cmd.dropFirst("hours on ".count))
+                if let parsed = IndexingHours.parse(arg) { hours = parsed }
+            case let cmd where cmd.hasPrefix("hours "):
+                let arg = String(cmd.dropFirst("hours ".count))
+                if let parsed = IndexingHours.parse(arg) { hours = parsed }
+            default: break
+            }
+        }
         wake.signal()
     }
 

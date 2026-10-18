@@ -141,7 +141,7 @@ function openSelected() {
 
 function revealSelected() {
   const hit = selectedHit();
-  if (hit) invoke("reveal", { path: hit.path }).catch(failed);
+  if (hit) invoke("reveal", { path: fileOf(hit) }).catch(failed);
 }
 
 /// The same search in the window, for a bigger look (only one kind, if given).
@@ -218,7 +218,7 @@ function row(hit) {
   item.append(thumbnail(hit));
   const text = element("div", "row-text");
   const title = element("div", "row-title");
-  title.append(element("span", "name", nameOf(hit.path)));
+  title.append(element("span", "name", titleOf(hit)));
   const place = placeOf(hit);
   if (place) title.append(element("span", "badge", place));
   const sub = element("div", "row-sub");
@@ -332,9 +332,13 @@ function picture(hit) {
     }
     default: {
       const passage = element("div", "passage" + (hit.kind === "code" ? " code" : ""));
-      passage.textContent = (hit.excerpt ?? "").replace(/[«»]/g, "");
-      ask({ op: "text", segment: hit.segment_id, code: state.isCode })
-        .then((reply) => { if (reply.text) passage.innerHTML = highlighted(reply.text, state.text); })
+      const nameOnly = hit.kind === "mail" && hit.segment !== "chunk";
+      passage.textContent = nameOnly ? "" : (hit.excerpt ?? "").replace(/[«»]/g, "");
+      previewText(hit, state.isCode)
+        .then((reply) => {
+          if (reply.text) passage.innerHTML = highlighted(reply.text, state.text);
+          else if (nameOnly) passage.textContent = "Not read yet: found by its subject.";
+        })
         .catch(() => {});
       return passage;
     }
@@ -343,7 +347,7 @@ function picture(hit) {
 
 function facts(hit) {
   const box = element("div", "facts");
-  box.append(element("div", "title", nameOf(hit.path)), element("div", "line", folderOf(hit)),
+  box.append(element("div", "title", titleOf(hit)), element("div", "line", folderOf(hit)),
              element("div", "line", details(hit)));
   const reason = element("div", "reason");
   reason.innerHTML = ICONS.found;
@@ -405,7 +409,7 @@ function renderBig() {
   const hit = selectedHit();
   if (!hit) return closeBig();
   const head = element("div", "head");
-  head.append(element("span", "name", nameOf(hit.path)));
+  head.append(element("span", "name", titleOf(hit)));
   const place = placeOf(hit);
   if (place) head.append(element("span", "place", place));
   let view;
@@ -532,17 +536,8 @@ function report() {
   debugPending = false;
   // Dev snapshots (index.html?big): the selected result's big preview, as Space shows it.
   if (new URLSearchParams(location.search).has("big")) toggleBig();
-  setTimeout(async () => {
+  setTimeout(() => {
     const big = $preview.querySelector("img, video, audio, .passage");
-    const media = big && (big.tagName === "AUDIO" || big.tagName === "VIDEO");
-    // A sound or a video plays through GStreamer on Linux: wait until it has read the file's metadata, or failed.
-    if (media && big.readyState < 1 && !big.error) {
-      await new Promise((resolve) => {
-        big.addEventListener("loadedmetadata", resolve, { once: true });
-        big.addEventListener("error", resolve, { once: true });
-        setTimeout(resolve, 30000);
-      });
-    }
     const thumbs = [...$list.querySelectorAll("img.thumb")];
     invoke("debug_report", {
       report: {
@@ -553,8 +548,7 @@ function report() {
         selected: state.selection && nameOf(state.selection),
         preview: big && {
           tag: big.tagName.toLowerCase(),
-          loaded: big.tagName === "IMG" ? big.complete && big.naturalWidth > 0 : media ? big.readyState >= 1 : null,
-          error: media && big.error ? big.error.code : null,
+          loaded: big.tagName === "IMG" ? big.complete && big.naturalWidth > 0 : null,
           size: big.tagName === "IMG" ? `${big.naturalWidth}x${big.naturalHeight}` : null,
           text: big.classList.contains("passage") ? big.textContent.slice(0, 80) : null,
         },

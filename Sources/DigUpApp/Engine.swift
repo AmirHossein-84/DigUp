@@ -1,3 +1,4 @@
+import DigUpLocalization
 import DigUpKit
 import Foundation
 
@@ -7,6 +8,7 @@ nonisolated struct EngineStatus: Sendable, Equatable {
         case starting
         case idle
         case syncing
+        /// Progress through the pending-file queue, across syncs and helper passes.
         case indexing(done: Int, total: Int)
         /// The rest of long PDFs and documents (`Indexer.finishLongFiles`): `done` of the `total` pages and chunks this
         /// pass set out to read, `files` long files still unfinished.
@@ -23,6 +25,8 @@ nonisolated struct EngineStatus: Sendable, Equatable {
     }
 
     var activity = Activity.starting
+    /// Transient discovery counts, separate from committed index totals.
+    var scan: CrawlProgress?
     var encoder = Encoder.stopped
     var files = 0        // in the index, any state
     var searchable = 0   // done or partial
@@ -43,6 +47,7 @@ nonisolated struct EngineStatus: Sendable, Equatable {
     var code = Code()
 
     struct Code: Sendable, Equatable {
+        var scan: CrawlProgress?
         var files = 0
         var searchable = 0
         var pending = 0
@@ -98,6 +103,7 @@ nonisolated final class Engine: @unchecked Sendable {
     private var helperInput: FileHandle?
     private var helperStarted = Date()
     private var helperOutput = Data()
+    private var indexProgress = IndexProgress()
     /// The folders changed while a helper ran: start a new one with them when it's gone.
     private var restartHelper = false
     /// When the helper's watchdog ended it lately (`stoppedOnFile`).
@@ -209,7 +215,7 @@ nonisolated final class Engine: @unchecked Sendable {
     func start() {
         searchQueue.async { [self] in
             guard openSearcher() else {
-                update { $0.activity = .failed("Can't open the index") }
+                update { $0.activity = .failed(L10n.text("Can't open the index")) }
                 return
             }
             indexQueue.async { [self] in startHelper() }
@@ -527,7 +533,7 @@ nonisolated final class Engine: @unchecked Sendable {
             try process.run()
         } catch {
             log("indexer: can't start \(process.executableURL?.path ?? "the helper"): \(error)")
-            update { $0.activity = .failed("Can't start indexing") }
+            update { $0.activity = .failed(L10n.text("Can't start indexing")) }
             return
         }
         helper = process
@@ -536,6 +542,10 @@ nonisolated final class Engine: @unchecked Sendable {
         helperOutput = Data()
         pruneWanted = false
         update {   // the helper says first if any are still missing or unreadable
+            $0.waitingForModel = false
+            if !roots.isEmpty { $0.activity = .syncing }
+            $0.scan = nil
+            $0.code.scan = nil
             $0.missingRoots = []
             $0.unreadableRoots = []
             $0.code.missingRoots = []
@@ -580,18 +590,31 @@ nonisolated final class Engine: @unchecked Sendable {
         func int(_ key: String) -> Int { event[key] as? Int ?? 0 }
         if event["code"] as? Bool == true { return handleCode(event) }
         switch event["event"] as? String {
+        case "scanning":
+            update {
+                $0.activity = .syncing
+                $0.scan = CrawlProgress(checked: int("checked"), root: event["root"] as? String)
+            }
         case "sync":
+            update {
+                $0.scan = nil
+                if case .syncing = $0.activity { $0.activity = .idle }
+            }
             if let started = event["started"] as? Double, let wanted = syncWantedAt,
                started >= wanted.timeIntervalSince1970 {
                 syncWantedAt = nil
             }
             applyCounts(event)
-            if int("new") > 0 { update { $0.activity = .indexing(done: 0, total: int("new")) } }
+            indexProgress.sync(pending: int("pending"))
+            if int("pending") > 0 {
+                let progress = indexProgress.progress()
+                update { $0.activity = .indexing(done: progress.done, total: progress.total) }
+            }
             log("sync: \(int("added")) new · \(int("changed")) changed · \(int("moved")) moved · "
                 + "\(int("removed")) removed · \(int("unchanged")) unchanged in \(int("ms")) ms")
         case "file":
-            let (done, total) = (int("done"), int("total"))
-            update { $0.activity = .indexing(done: done, total: total) }
+            let progress = indexProgress.progress(passDone: int("done"))
+            update { $0.activity = .indexing(done: progress.done, total: progress.total) }
             if event["new"] as? Bool == true, let path = event["path"] as? String {
                 log(String(format: "index: %@ %@ in %.2f s", (path as NSString).lastPathComponent,
                            event["state"] as? String ?? "?", event["seconds"] as? Double ?? 0))
@@ -606,14 +629,27 @@ nonisolated final class Engine: @unchecked Sendable {
             let what = event["rest"] as? Bool == true ? "the rest of long files"
                 : event["new"] as? Bool == true ? "new files" : "backfill"
             log("index: \(what): \(states) in \(int("ms")) ms")
+            if event["rest"] as? Bool != true {
+                let processed = (event["states"] as? [String: Int] ?? [:]).values.reduce(0, +)
+                indexProgress.processed(processed)
+                let progress = indexProgress.progress()
+                update { $0.activity = .indexing(done: progress.done, total: progress.total) }
+            }
         case "idle":
             applyCounts(event)
-            update { $0.activity = .idle }
+            if int("pending") == 0 { indexProgress.reset() }
+            update {
+                $0.scan = nil
+                $0.code.scan = nil
+                $0.activity = .idle
+            }
             refreshSearcher(force: true)
         case "waiting":
             applyCounts(event)
             update {
                 $0.activity = .idle
+                $0.scan = nil
+                $0.code.scan = nil
                 $0.waitingForModel = true
             }
             log("indexer: waiting for the model to download")
@@ -635,8 +671,12 @@ nonisolated final class Engine: @unchecked Sendable {
         case "reindex":
             log("indexer: the model or settings changed, indexing everything again (was: \(event["from"] as? String ?? "?"))")
         case "error":
+            update {
+                $0.scan = nil
+                if case .syncing = $0.activity { $0.activity = .idle }
+            }
             log("indexer: \(event["message"] as? String ?? "error")")
-            if event["fatal"] as? Bool == true { update { $0.activity = .failed("Indexing stopped") } }
+            if event["fatal"] as? Bool == true { update { $0.activity = .failed(L10n.text("Indexing stopped")) } }
         default:
             break
         }
@@ -646,7 +686,10 @@ nonisolated final class Engine: @unchecked Sendable {
     private func handleCode(_ event: [String: Any]) {
         func int(_ key: String) -> Int { event[key] as? Int ?? 0 }
         switch event["event"] as? String {
+        case "scanning":
+            update { $0.code.scan = CrawlProgress(checked: int("checked"), root: event["root"] as? String) }
         case "sync":
+            update { $0.code.scan = nil }
             applyCounts(event)
             // New code is read right away only when the main index has nothing waiting; else it waits its turn.
             if int("new") > 0, int("pending") == 0 { update { $0.code.indexing = .init(done: 0, total: int("new")) } }
@@ -677,8 +720,9 @@ nonisolated final class Engine: @unchecked Sendable {
         case "reindex":
             log("indexer: the model changed, the code index starts over")
         case "error":
+            update { $0.code.scan = nil }
             log("indexer: code: \(event["message"] as? String ?? "error")")
-            if event["fatal"] as? Bool == true { update { $0.activity = .failed("Indexing stopped") } }
+            if event["fatal"] as? Bool == true { update { $0.activity = .failed(L10n.text("Indexing stopped")) } }
         default:
             break
         }
@@ -712,6 +756,9 @@ nonisolated final class Engine: @unchecked Sendable {
             if case .indexing = $0.activity { $0.activity = .idle }
             if case .finishing = $0.activity { $0.activity = .idle }
             if case .starting = $0.activity { $0.activity = .idle }
+            if case .syncing = $0.activity { $0.activity = .idle }
+            $0.scan = nil
+            $0.code.scan = nil
             $0.code.indexing = nil
         }
         refreshSearcher(force: true)

@@ -1,5 +1,6 @@
 import Foundation
 
+/// One result of a search (`Searcher.search`), pointing to a file and the part of it that matched.
 public struct SearchHit: Sendable {
     public let path: String
     public let kind: FileKind
@@ -70,9 +71,9 @@ public final class Searcher {
             SELECT s.id, s.file, s.modality, s.vec, s.kind, s.loc, f.kind, CAST(json_extract(f.info, '$.pages') AS INTEGER)
             FROM segments s JOIN files f ON f.id = s.file WHERE s.vec IS NOT NULL ORDER BY s.id
             """) { row in
-            guard let blob = row.blob(3), blob.count == rowBytes, rowFile.count < rows else { return }
-            blob.copyBytes(to: UnsafeMutableRawBufferPointer(start: matrix.halves + rowFile.count * Vectors.dimension,
-                                                             count: rowBytes))
+            guard rowFile.count < rows,
+                  row.copyBlob(3, to: matrix.halves + rowFile.count * Vectors.dimension, bytes: rowBytes)
+            else { return }
             rowSegment.append(row.int(0))
             rowFile.append(row.int(1))
             rowModality.append(Modality(rawValue: row.text(2) ?? "") ?? .none)
@@ -117,7 +118,7 @@ public final class Searcher {
         let wordWeight = wordWeight ?? (isCode ? Self.codeWordWeight : Self.wordWeight)
         if queryVector != nil, !vectorsLoaded { try reload() }
         let fileKind = self.fileKind
-        let allowed = { (file: Int64) -> Bool in kinds == nil || fileKind[file].map { kinds!.contains($0) } ?? false }
+        let allowed = { (file: Int64) -> Bool in fileKind[file].map { kinds?.contains($0) ?? true } ?? false }
 
         // Meaning: score every vector on this query's scale (`meaning`), keep each file's best segment.
         var best: [Int64: (z: Double, cosine: Double, row: Int)] = [:]
@@ -143,8 +144,15 @@ public final class Searcher {
         // as typed stays whole, so "cat" doesn't bring in "category"; so does a word of two letters, the start of too
         // many words to stand for one.
         if identifier == nil {
-            for index in terms.indices where terms[index].count >= 3 && !patterns[index].hasSuffix("*") {
-                if try !isIndexed(patterns[index]) { patterns[index] += "*" }
+            for index in terms.indices where terms[index].count >= 3
+                && !(prefixLast && index == terms.count - 1) && !SearchText.inflects(terms[index]) {
+                if try !isIndexed(patterns[index]) {
+                    if terms[index].contains(where: SearchText.isHan) {
+                        // Names are still whole Han tokens: retain their schema-5 missing-word prefix fallback.
+                        // Body phrases must remain contiguous exact sequences of Han characters.
+                        patterns[index] = "(name : \"\(terms[index])\"* OR body : \"\(SearchText.indexed(terms[index]))\")"
+                    } else { patterns[index] += "*" }
+                }
             }
         }
         if !patterns.isEmpty {
@@ -157,7 +165,8 @@ public final class Searcher {
                 let file = row.int(0)
                 guard words.count < 100, allowed(file), seen.insert(file).inserted else { return }
                 // Text that normalizing changed is quoted as it's written (with its hamza, harakat, joiners).
-                let snippet = row.text(3).flatMap { SearchText.snippet($0, terms: terms) } ?? row.text(2)
+                // Stemming may match without a literal highlight. Never show the indexed Han separators.
+                let snippet = row.text(3).map { SearchText.snippet($0, terms: terms) ?? excerpt($0) } ?? row.text(2)
                 words.append((file, row.int(1), snippet))
             }
             if !words.isEmpty {
@@ -171,6 +180,15 @@ public final class Searcher {
             }
         }
 
+        // Han words have no spaces: unicode61 keeps a whole filename run as one token, so a two-character
+        // lookup in its middle cannot match FTS. Read only name rows, without rebuilding indexes or embeddings.
+        let names = try hanFilenameMatches(text, allowed: allowed)
+        let nameStrength = Dictionary(names.map { ($0.file, $0.strength) }, uniquingKeysWith: max)
+        if !names.isEmpty {
+            words = names.map { ($0.file, $0.segment, nil) } + words.filter { nameStrength[$0.file] == nil }
+            for name in names { coverage[name.file] = 1 }
+        }
+
         // A file qualifies by standing out in meaning, or by containing at least half of the query's words.
         // Score: meaning z + a bonus that grows with word coverage, + 1 for the kind the query asks for.
         // One common word can't beat a strong meaning match; all the words of an exact lookup usually do.
@@ -179,24 +197,40 @@ public final class Searcher {
         let (meaningWeight, wordsWeight) = lookup ? (0.5, wordWeight * 2) : (1, wordWeight)
         let hinted = Self.kindHints(text)
         var candidates = Set(best.filter { $0.value.z >= zGate }.keys)
-        for (file, share) in coverage where share >= 0.5 { candidates.insert(file) }
+        for (file, share) in coverage where share >= 0.5 && allowed(file) { candidates.insert(file) }
         var scored: [Int64: Double] = [:]
-        for file in candidates {
+        for file in candidates where allowed(file) {
             var score = meaningWeight * max(best[file]?.z ?? 0, 0) + wordsWeight * pow(coverage[file] ?? 0, 1.5)
             if let kind = fileKind[file], hinted.contains(kind) { score += 1 }
             scored[file] = score
         }
 
+        // A literal basename match is a lookup, not just another semantic hint. Put complete names ahead of
+        // partial names, and both ahead of content-only matches. Keep scores in rank order for strongCount().
+        let highest = scored.values.max() ?? 0
+        for (file, strength) in nameStrength where allowed(file) { scored[file] = highest + Double(strength) }
+
         let wordRank = Dictionary(words.enumerated().map { ($0.element.file, ($0.offset + 1, $0.element)) },
                                   uniquingKeysWith: { first, _ in first })
-        var hits: [SearchHit] = []
+        // Each hit used to read its file and segment rows with one SELECT each (N+1). Instead: decide what every
+        // hit points at first, then fetch all needed rows with `id IN (…)` (chunked at 500, SQLite caps the terms
+        // of an IN list) and fill the hits in from the maps, preserving the order.
+        struct PendingHit {
+            let file: Int64
+            let score: Double
+            let semantic: (z: Double, cosine: Double, row: Int)?
+            let keyword: (Int, (file: Int64, segment: Int64, snippet: String?))?
+            let segmentID: Int64
+            let focus: Double?
+        }
+        var pending: [PendingHit] = []
         for (file, score) in scored.sorted(by: { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) })
             .prefix(limit) {
-            let rank = hits.count
+            let rank = pending.count
             let semantic = best[file]
             let keyword = wordRank[file]
             // Point at the best meaning segment if it stands out; else at the segment the words matched.
-            let useMeaning = semantic.map { $0.z >= zGate || keyword == nil } ?? false
+            let useMeaning = nameStrength[file] == nil && (semantic.map { $0.z >= zGate || keyword == nil } ?? false)
             guard var segmentID = useMeaning ? semantic.map({ rowSegment[$0.row] }) : keyword?.1.segment else { continue }
             var focus: Double?
             if isCode {
@@ -207,43 +241,106 @@ public final class Searcher {
                                                    identifier: rank < 10 ? identifier : nil, query: text, terms: terms,
                                                    wordsHere: keyword?.1.segment == segmentID || identifier != nil)
             }
-            var path = "", kind = FileKind.doc, modified = 0.0, size: Int64 = 0, info: [String: String] = [:]
-            try store.db.query("SELECT path, kind, mtime, size, info FROM files WHERE id = ?", [.int(file)]) {
-                path = $0.text(0) ?? ""
-                kind = FileKind(rawValue: $0.text(1) ?? "") ?? .doc
-                modified = $0.double(2)
-                size = $0.int(3)
-                if let json = $0.text(4)?.data(using: .utf8) {
+            pending.append(PendingHit(file: file, score: score, semantic: semantic, keyword: keyword,
+                                      segmentID: segmentID, focus: focus))
+        }
+        var fileRows: [Int64: (path: String, kind: FileKind, modified: Double, size: Int64, info: [String: String])] = [:]
+        var segmentRows: [Int64: (kind: SegmentKind, loc: Double?, locEnd: Double?, excerpt: String?)] = [:]
+        let fileIDs = Array(Set(pending.map(\.file)))
+        // The borrowed-snippet check below also reads the kind of the segment the words matched, so batch those too.
+        let segmentIDs = Array(Set(pending.map(\.segmentID) + pending.compactMap { $0.keyword?.1.segment }))
+        for start in stride(from: 0, to: fileIDs.count, by: 500) {
+            let chunk = fileIDs[start..<min(start + 500, fileIDs.count)]
+            try store.db.query("""
+                SELECT id, path, kind, mtime, size, info FROM files
+                WHERE id IN (\(chunk.map(String.init).joined(separator: ",")))
+                """) { row in
+                var info: [String: String] = [:]
+                if let json = row.text(5)?.data(using: .utf8) {
                     info = (try? JSONSerialization.jsonObject(with: json) as? [String: String]) ?? [:]
                 }
+                fileRows[row.int(0)] = (row.text(1) ?? "", FileKind(rawValue: row.text(2) ?? "") ?? .doc,
+                                        row.double(3), row.int(4), info)
             }
-            var segment = SegmentKind.name, loc: Double?, locEnd: Double?, storedExcerpt: String?
-            try store.db.query("SELECT kind, loc, loc_end, excerpt FROM segments WHERE id = ?", [.int(segmentID)]) {
-                segment = SegmentKind(rawValue: $0.text(0) ?? "") ?? .name
-                loc = $0.isNull(1) ? nil : $0.double(1)
-                locEnd = $0.isNull(2) ? nil : $0.double(2)
-                storedExcerpt = $0.text(3)
+        }
+        for start in stride(from: 0, to: segmentIDs.count, by: 500) {
+            let chunk = segmentIDs[start..<min(start + 500, segmentIDs.count)]
+            try store.db.query("""
+                SELECT id, kind, loc, loc_end, excerpt FROM segments
+                WHERE id IN (\(chunk.map(String.init).joined(separator: ",")))
+                """) { row in
+                segmentRows[row.int(0)] = (SegmentKind(rawValue: row.text(1) ?? "") ?? .name,
+                                           row.isNull(2) ? nil : row.double(2),
+                                           row.isNull(3) ? nil : row.double(3), row.text(4))
             }
+        }
+        var hits: [SearchHit] = []
+        for hit in pending {
+            let fileRow = fileRows[hit.file]
+            let path = fileRow?.path ?? ""
+            let kind = fileRow?.kind ?? .doc
+            let modified = fileRow?.modified ?? 0.0
+            let size = fileRow?.size ?? 0
+            let info = fileRow?.info ?? [:]
+            let segmentRow = segmentRows[hit.segmentID]
+            let segment = segmentRow?.kind ?? .name
+            let loc = segmentRow?.loc
+            let locEnd = segmentRow?.locEnd
+            let storedExcerpt = segmentRow?.excerpt
             // Quote the matched words only when they come from the segment we point at, so a PDF hit on page 5
             // never shows page 2's words. A segment with no place and no text of its own (a screenshot's image
             // vector) can borrow them from its file's OCR text, which describes the same picture.
-            var snippet = keyword.flatMap { $0.1.segment == segmentID ? $0.1.snippet : nil }
-                .flatMap { $0.contains("«") ? excerpt($0, limit: 400) : nil }
-            if snippet == nil, storedExcerpt == nil, loc == nil, let match = keyword?.1,
+            var snippet = hit.keyword.flatMap { $0.1.segment == hit.segmentID ? $0.1.snippet : nil }
+                .flatMap { $0.contains("«") || segment != .name ? excerpt($0, limit: 400) : nil }
+            if snippet == nil, storedExcerpt == nil, loc == nil, let match = hit.keyword?.1,
                let text = match.snippet, text.contains("«") {
-                var matchedKind: String?
-                try store.db.query("SELECT kind FROM segments WHERE id = ?", [.int(match.segment)]) {
-                    matchedKind = $0.text(0)
-                }
-                if matchedKind != SegmentKind.name.rawValue { snippet = excerpt(text, limit: 400) }
+                if segmentRows[match.segment]?.kind != .name { snippet = excerpt(text, limit: 400) }
             }
-            hits.append(SearchHit(path: path, kind: kind, score: score, z: semantic?.z, cosine: semantic?.cosine,
-                                  keywordRank: keyword?.0, segment: segment, segmentID: segmentID, loc: loc,
+            hits.append(SearchHit(path: path, kind: kind, score: hit.score, z: hit.semantic?.z,
+                                  cosine: hit.semantic?.cosine,
+                                  keywordRank: hit.keyword?.0, segment: segment, segmentID: hit.segmentID, loc: loc,
                                   locEnd: locEnd,
                                   excerpt: snippet ?? storedExcerpt, modified: modified, size: size, info: info,
-                                  focus: focus))
+                                  focus: hit.focus))
         }
         return hits
+    }
+
+    private struct FilenameMatch {
+        let file: Int64
+        let segment: Int64
+        let strength: Int
+    }
+
+    /// A cheap SQLite prefilter uses a literal Han run (never LIKE wildcards). Verify every query component against
+    /// the normalized basename, including numbers and extensions. Folders and document contents cannot qualify.
+    private func hanFilenameMatches(_ text: String, allowed: (Int64) -> Bool) throws -> [FilenameMatch] {
+        guard !isCode else { return [] }
+        let query = SearchText.normalized(text).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        var longest = "", run = ""
+        for scalar in query.unicodeScalars {
+            switch scalar.value {
+            case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF, 0x20000...0x2FA1F, 0x30000...0x323AF:
+                run.unicodeScalars.append(scalar)
+                if run.unicodeScalars.count > longest.unicodeScalars.count { longest = run }
+            default:
+                run = ""
+            }
+        }
+        guard longest.unicodeScalars.count >= 2 else { return [] }
+        let terms = query.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+        var matches: [FilenameMatch] = []
+        try store.db.query("""
+            SELECT s.file, s.id, fts.name FROM segments s JOIN fts ON fts.rowid = s.id
+            WHERE s.kind = 'name' AND instr(fts.name, ?) > 0
+            """, [.text(longest)]) { row in
+                let file = row.int(0)
+                guard allowed(file), let name = row.text(2)?.lowercased(),
+                      terms.allSatisfy({ name.contains($0) }) else { return }
+                let exact = name == query || (name as NSString).deletingPathExtension == query
+                matches.append(FilenameMatch(file: file, segment: row.int(1), strength: exact ? 2 : 1))
+            }
+        return matches.sorted { $0.strength > $1.strength || ($0.strength == $1.strength && $0.file < $1.file) }
     }
 
     /// Code: the stretch to point at, and the line in it to open at. A name looked up points at the stretch that
@@ -395,7 +492,12 @@ public final class Searcher {
     static func patterns(_ terms: [String], prefixLast: Bool) -> [String] {
         terms.enumerated().map { index, term in
             let prefix = (prefixLast && index == terms.count - 1) || SearchText.inflects(term)
-            return "\"\(term)\"" + (prefix ? "*" : "")
+            let suffix = prefix ? "*" : ""
+            if term.contains(where: SearchText.isHan) {
+                // Keep name matching (and the filename substring fallback) compatible with schema 5.
+                return "(name : \"\(term)\"\(suffix) OR body : \"\(SearchText.indexed(term))\"\(suffix))"
+            }
+            return "\"\(term)\"" + suffix
         }
     }
 

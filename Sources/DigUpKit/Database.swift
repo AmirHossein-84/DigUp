@@ -5,6 +5,43 @@ import SQLite3   // the system's (3.51 on macOS 26, FTS5 built in)
 import CSQLite   // the amalgamation in Vendor/sqlite, with FTS5 (scripts/fetch-vendor.sh)
 #endif
 
+/// Cache of prepared SQLite statements, supporting statement reuse via sqlite3_reset,
+/// check-out/check-in for recursive queries and retained statements, and bounded LRU eviction.
+public final class StatementCache {
+    private var statements: [String: OpaquePointer] = [:]
+    private let limit: Int
+
+    init(limit: Int = 64) {
+        self.limit = limit
+    }
+
+    deinit {
+        clear()
+    }
+
+    func clear() {
+        for statement in statements.values {
+            sqlite3_finalize(statement)
+        }
+        statements.removeAll()
+    }
+
+    func take(_ sql: String) -> OpaquePointer? {
+        statements.removeValue(forKey: sql)
+    }
+
+    func recycle(_ sql: String, statement: OpaquePointer) {
+        if let previous = statements.removeValue(forKey: sql) {
+            sqlite3_finalize(previous)
+        }
+        if statements.count >= limit, let key = statements.keys.first,
+           let evicted = statements.removeValue(forKey: key) {
+            sqlite3_finalize(evicted)
+        }
+        statements[sql] = statement
+    }
+}
+
 /// A thin wrapper over SQLite. One connection, used from one thread.
 public final class Database {
     public struct Failure: Error, CustomStringConvertible {
@@ -13,6 +50,9 @@ public final class Database {
     }
 
     let handle: OpaquePointer
+    /// Nesting depth of `transaction(_:)`; only the outermost call begins/commits the SQL transaction.
+    private var transactionDepth = 0
+    public let statementCache: StatementCache
 
     public init(path: String) throws {
         var db: OpaquePointer?
@@ -22,6 +62,7 @@ public final class Database {
             throw Failure(message: message)
         }
         handle = db
+        statementCache = StatementCache()
         sqlite3_busy_timeout(db, 5000)
         // Two processes opening a new index at once (a shell starts its search and index helpers together): the switch
         // to WAL can fail at once with "database is locked" rather than wait (SQLite's rule against deadlocks), so it's
@@ -29,16 +70,22 @@ public final class Database {
         var tries = 0
         while true {
             do {
-                try execute("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
+                try execute("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA cache_size = -64000; PRAGMA temp_store = MEMORY;")
                 break
             } catch where sqlite3_errcode(db) == SQLITE_BUSY && tries < 50 {
                 tries += 1
                 Thread.sleep(forTimeInterval: 0.1)
             }
         }
+        // Keyword search (bm25 over FTS5) spends most of its time pinning purgeable page-cache pages on macOS.
+        // Mapping the file skips that path; on a 64k-vector index keystroke search is ~2× faster (issue #93).
+        try execute("PRAGMA mmap_size = 1073741824")
     }
 
-    deinit { sqlite3_close_v2(handle) }
+    deinit {
+        statementCache.clear()
+        sqlite3_close_v2(handle)
+    }
 
     public func execute(_ sql: String) throws {
         var error: UnsafeMutablePointer<CChar>?
@@ -51,22 +98,38 @@ public final class Database {
 
     /// Runs `sql` with `values` bound and calls `row` for each result row.
     public func query(_ sql: String, _ values: [SQLValue] = [], row: (Statement) throws -> Void = { _ in }) throws {
-        let statement = try Statement(self, sql)
+        var statement = try Statement(self, sql, prepared: statementCache.take(sql))
+        defer {
+            // A caller can keep a row's Statement. Leave its ownership alone in that case.
+            if isKnownUniquelyReferenced(&statement) {
+                let prepared = statement.recycle()
+                statementCache.recycle(sql, statement: prepared)
+            }
+        }
         try statement.bind(values)
         while try statement.step() { try row(statement) }
     }
 
     public func run(_ sql: String, _ values: [SQLValue] = []) throws { try query(sql, values) }
 
+    /// Reentrant: nested calls run their body inside the outermost transaction.
     @discardableResult
     public func transaction<T>(_ body: () throws -> T) throws -> T {
+        guard transactionDepth == 0 else {
+            transactionDepth += 1
+            defer { transactionDepth -= 1 }
+            return try body()
+        }
         try execute("BEGIN IMMEDIATE")
+        transactionDepth = 1
         do {
             let result = try body()
             try execute("COMMIT")
+            transactionDepth = 0
             return result
         } catch {
             try? execute("ROLLBACK")
+            transactionDepth = 0
             throw error
         }
     }
@@ -85,8 +148,14 @@ public enum SQLValue {
 public final class Statement {
     private let statement: OpaquePointer
     private let db: Database
+    private var ownsStatement = true
 
-    init(_ db: Database, _ sql: String) throws {
+    init(_ db: Database, _ sql: String, prepared: OpaquePointer? = nil) throws {
+        if let prepared {
+            statement = prepared
+            self.db = db
+            return
+        }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db.handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw Database.Failure(message: "\(db.errorMessage) (in: \(sql.prefix(160)))")
@@ -95,9 +164,22 @@ public final class Statement {
         self.db = db
     }
 
-    deinit { sqlite3_finalize(statement) }
+    deinit {
+        if ownsStatement { sqlite3_finalize(statement) }
+    }
+
+    fileprivate func recycle() -> OpaquePointer {
+        // reset can report the previous step's error, which query already propagated.
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        ownsStatement = false
+        return statement
+    }
 
     func bind(_ values: [SQLValue]) throws {
+        guard values.count == Int(sqlite3_bind_parameter_count(statement)) else {
+            throw Database.Failure(message: "expected \(sqlite3_bind_parameter_count(statement)) SQL values, got \(values.count)")
+        }
         for (offset, value) in values.enumerated() {
             let index = Int32(offset + 1)
             let status: Int32
@@ -132,6 +214,15 @@ public final class Statement {
     public func blob(_ column: Int32) -> Data? {
         guard let bytes = sqlite3_column_blob(statement, column) else { return nil }
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, column)))
+    }
+
+    /// Copies the blob at `column` into `destination` when its length is exactly `bytes` (loading vectors into the
+    /// matrix without a `Data` intermediate; ~17% faster on a 64k-vector index, issue #93).
+    public func copyBlob(_ column: Int32, to destination: UnsafeMutableRawPointer, bytes: Int) -> Bool {
+        guard let source = sqlite3_column_blob(statement, column),
+              Int(sqlite3_column_bytes(statement, column)) == bytes else { return false }
+        destination.copyMemory(from: source, byteCount: bytes)
+        return true
     }
 }
 

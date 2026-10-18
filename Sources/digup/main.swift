@@ -34,6 +34,9 @@ let usage = """
                                               resume, checked (JSON lines: see DownloadModel)
 
     Options:
+      --parent-pid PID     app-owned helper: exit when this parent exits (omit for standalone CLI)
+      --hours START-END    index only between these hours (e.g. 01:00-07:00)
+      --resume-pending     resume indexing pending files before crawling
       --index DIR          index folder (default: DigUp's Application Support folder; see `digup status`)
       --code               estimate, index or show the code index of these folders (code.sqlite in the index
                            folder): source files, their repos' docs and notebooks, minus what git ignores
@@ -65,7 +68,8 @@ struct Arguments {
     var flags: Set<String> = []
     static let valued: Set<String> = ["--index", "--limit", "--kind", "-n", "--zgate", "--word-weight", "--new-limit",
                                       "--linger", "--shot-tokens", "--code-stretch", "--encoder-idle", "--to",
-                                      "--memory-limit", "--time-limit", "--tries", "--when-quiet"]
+                                      "--memory-limit", "--time-limit", "--tries", "--when-quiet", "--parent-pid",
+                                      "--hours"]
     static let repeated: Set<String> = ["--exclude", "--exclude-ext", "--code-root", "--code-exclude"]
 
     init(_ raw: ArraySlice<String>) throws {
@@ -416,6 +420,11 @@ func status(_ args: Arguments) throws {
 
 /// The app's indexing helper: sync + index on request, JSON events out (IndexService.swift).
 func indexService(_ args: Arguments) throws -> Int32 {
+    let resumePending = args.flags.contains("--resume-pending")
+    guard !resumePending || (args.options.excludedFolders.isEmpty && args.options.excludedExtensions.isEmpty) else {
+        throw CLIError("--resume-pending requires no excluded folders or types; sync must reconcile exclusions first")
+    }
+    let hours = args.values["--hours"].flatMap(IndexingHours.parse)
     // One model for both indexes, started when the first file needs it (`SharedEmbedder`).
     let model = SharedEmbedder {
         try makeEmbedder(textOnly: false, log: args.indexFolder.appendingPathComponent("worker.log"), qos: .utility)
@@ -451,7 +460,9 @@ func indexService(_ args: Arguments) throws -> Int32 {
                                modelReady: { embedderSource() == nil || LlamaModels.complete },
                                backfill: args.flags.contains("--backfill"),
                                newFilesLimit: args.values["--new-limit"].flatMap(Int.init) ?? 50,
-                               linger: args.values["--linger"].flatMap(Double.init) ?? 60)
+                               linger: args.values["--linger"].flatMap(Double.init) ?? 60,
+                               resumePending: resumePending,
+                               hours: hours)
     return service.serve()
 }
 
@@ -697,7 +708,12 @@ do {
         exit(0)
     }
     let args = try Arguments(raw.dropFirst())
-    if ["index-service", "worker", "search-service", "download-model"].contains(command)
+    if let parentPidArg = args.values["--parent-pid"] {
+        guard let pid = Int32(parentPidArg), pid > 1 else {
+            throw CLIError("--parent-pid needs a PID greater than 1")
+        }
+        ParentWatch.start(parentPid: pid)
+    } else if ["index-service", "worker", "search-service", "download-model"].contains(command)
         || command == "estimate" && args.flags.contains("--json") {
         ParentWatch.start()   // an app's helper goes when the app does
     }

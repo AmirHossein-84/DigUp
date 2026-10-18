@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
 
 public enum Classification: Equatable, Sendable {
     case index(FileKind)
@@ -11,7 +14,8 @@ public enum Classification: Equatable, Sendable {
 public enum Rules {
     /// Folders never worth walking into. Hidden folders and bundles are skipped by the enumerator itself.
     static let skippedFolderNames: Set<String> = [
-        "node_modules", "bower_components", "venv", "site-packages", "__pycache__", "DerivedData", "Pods", "Carthage",
+        "node_modules", "bower_components", "venv", ".venv", "site-packages", "__pycache__", "DerivedData", "Pods", "Carthage",
+        "target", ".build", ".next", "dist", "bin", "obj",
     ]
 
     /// Any of these in a folder makes it a code project, where only screenshots are indexed.
@@ -21,7 +25,13 @@ public enum Rules {
     ]
     static let projectBundleExtensions: Set<String> = ["xcodeproj", "xcworkspace"]
 
-    static let docExtensions: Set<String> = ["txt", "text", "md", "markdown", "rtf", "docx", "doc", "odt", "html", "htm"]
+    static let docExtensions: Set<String> = [
+        "txt", "text", "md", "markdown", "rtf", "docx", "doc", "odt", "html", "htm", "typ", "xlsx", "pptx", "ods", "odp",
+    ]
+
+    /// FairPlay-protected music (Apple Music downloads, iTunes Store songs bought before 2009): only the Music app can
+    /// play it. Reading it fails ("Cannot Decode", "may be damaged"), so it's skipped rather than counted as failed.
+    static let protectedExtensions: Set<String> = ["m4p"]
 
     /// Source code and data files: off by default (your editor and ripgrep search them better, and they flood an index).
     static let codeExtensions: Set<String> = [
@@ -90,7 +100,7 @@ public enum Rules {
                                         "crt", "cer", "der", "p8", "mobileprovision"]
         if secretTypes.contains((lower as NSString).pathExtension) { return true }
         return ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".env", "secret", "credential", ".netrc", ".npmrc",
-                ".pypirc", "htpasswd", ".htpasswd"].contains(where: lower.hasPrefix)
+                ".pypirc", "htpasswd", ".htpasswd", "password", "passwd"].contains(where: lower.hasPrefix)
     }
 
     /// Why code search doesn't go into a folder (`codeSkippedFolderNames`), or nil.
@@ -128,6 +138,7 @@ public enum Rules {
     /// live under ~/Library, and the log line about a change is a change again.
     public static func isWalked(_ path: String, root: String, home: String, excluded: [String]) -> Bool {
         guard path == root || FolderSelection.isInside(path, root) else { return false }
+        if isCacheDirectory(URL(fileURLWithPath: root)) { return false }
         var folder = root
         for part in path.dropFirst(root.count).split(separator: "/") {
             folder += "/" + part
@@ -143,9 +154,59 @@ public enum Rules {
         let name = url.lastPathComponent
         if skippedFolderNames.contains(name) { return "developer folder" }
         if name.hasSuffix(".noindex") { return ".noindex folder" }
+        if isCacheDirectory(url) { return "cache folder" }
         if url.path == home + "/Library" { return "~/Library" }
         if excluded.contains(where: { url.path == $0 || url.path.hasPrefix($0 + "/") }) { return "excluded folder" }
         return nil
+    }
+
+    /// The Cache Directory Tagging specification requires this exact 43-byte header, not just the filename.
+    static func isCacheDirectory(_ url: URL) -> Bool {
+        let tag = url.appendingPathComponent("CACHEDIR.TAG")
+        guard let info = FileSystem.info(of: tag.path), info.isRegular, !info.dataless,
+              let handle = try? FileHandle(forReadingFrom: tag) else { return false }
+        defer { try? handle.close() }
+        let signature = Data("Signature: 8a477f597d28d172789f06886806bc55".utf8)
+        return (try? handle.read(upToCount: signature.count)) == signature
+    }
+
+    /// Whether a change the folder watcher reports at `path` can change what's indexed: a folder (created, moved or
+    /// removed with what's in it), or a file of a type the crawl indexes that isn't inside a bundle (which the crawl
+    /// skips whole). A database rewritten every few seconds asked for a full sync each time, which found nothing new
+    /// and took minutes on a big folder: MongoDB's diagnostic.data on the Desktop kept the helper busy all day.
+    public static func changeMayMatter(_ path: String, isFolder: Bool, excludedExtensions: Set<String>) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        // Only folders with an extension can be bundles, so most changes ask the file system nothing.
+        var folder = isFolder ? url : url.deletingLastPathComponent()
+        while folder.path != "/" && !folder.path.isEmpty {
+            #if canImport(UniformTypeIdentifiers)
+            if !folder.pathExtension.isEmpty,
+               (try? folder.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true {
+                return false
+            }
+            #else
+            if !folder.pathExtension.isEmpty,
+               FileSystem.isPackage(folder, nil) {
+                return false
+            }
+            #endif
+            let parent = folder.deletingLastPathComponent()
+            if parent.path == folder.path { break }
+            folder = parent
+        }
+        if isFolder { return true }
+        var options = IndexOptions()
+        options.excludedExtensions = excludedExtensions
+        #if canImport(UniformTypeIdentifiers)
+        if case .index = classify(url, type: UTType(filenameExtension: url.pathExtension), options: options) {
+            return true
+        }
+        #else
+        if case .index = classify(url, values: nil, options: options) {
+            return true
+        }
+        #endif
+        return false
     }
 
     static func isProjectRoot(_ folder: String) -> Bool {

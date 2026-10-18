@@ -58,11 +58,12 @@ let appDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
 ]
 let appTargets: [Target] = [
+    .testTarget(name: "DigUpAppTests", dependencies: ["DigUpApp"]),
     // The menubar + hotkey app. build.sh wraps it into build.noindex/DigUp.app. (The product can't be called
     // "DigUp": on a case-insensitive disk it would collide with the `digup` CLI binary.)
     .executableTarget(
         name: "DigUpApp",
-        dependencies: ["DigUpKit", .product(name: "Sparkle", package: "Sparkle")],
+        dependencies: ["DigUpKit", "DigUpLocalization", .product(name: "Sparkle", package: "Sparkle")],
         swiftSettings: [.defaultIsolation(MainActor.self)],
         linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
     ),
@@ -75,6 +76,7 @@ let appTargets: [Target] = []
 
 let package = Package(
     name: "DigUp",
+    defaultLocalization: "en",
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "digup", targets: ["digup"]),
@@ -82,6 +84,9 @@ let package = Package(
     ] + appProducts,
     dependencies: appDependencies,
     targets: portableTargets + [
+        // Interface localization resources for macOS app.
+        .target(name: "DigUpLocalization", resources: [.process("Resources")]),
+        .testTarget(name: "DigUpLocalizationTests", dependencies: ["DigUpLocalization"]),
         // The engine: crawler, extractors, index store, the embedder interface and worker client, search. No UI.
         // Platform/ holds what differs by OS (Apple's frameworks on macOS, the C libraries above elsewhere).
         .target(name: "DigUpKit", dependencies: engineDependencies, linkerSettings: engineLink),
@@ -96,5 +101,6 @@ let package = Package(
         .testTarget(name: "DigUpKitTests", dependencies: ["DigUpKit"] + testDependencies, exclude: ["Pictures", "Videos"]),
         // Reference/ holds the fixed inputs and vectors of ReferenceVectorTests, read by path.
         .testTarget(name: "LlamaRuntimeTests", dependencies: ["LlamaRuntime"], exclude: ["Reference"]),
+        .testTarget(name: "digupTests", dependencies: ["digup"]),
     ] + appTargets
 )

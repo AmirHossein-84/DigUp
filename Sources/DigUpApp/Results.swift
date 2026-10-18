@@ -1,3 +1,4 @@
+import DigUpLocalization
 import AppKit
 import DigUpKit
 
@@ -22,6 +23,8 @@ struct ResultRow: Identifiable, Equatable {
     let info: [String: String]
     /// The query's words (`Searcher.terms`): what the preview highlights on a page or in a passage.
     let terms: [String]
+    /// An app the panel can launch (`AppLauncher`), not a file from the index: its `kind` means nothing.
+    let isApp: Bool
 
     init(_ hit: SearchHit, terms: [String] = []) {
         id = hit.path
@@ -47,6 +50,7 @@ struct ResultRow: Identifiable, Equatable {
         size = hit.size
         info = hit.info
         self.terms = terms
+        isApp = false
     }
 
     /// The name to show: left to right as Finder shows it, also when it starts in Arabic ("ملاحظة.md", not "md.ملاحظة").
@@ -69,7 +73,7 @@ struct ResultRow: Identifiable, Equatable {
     var place: String? {
         guard let loc else { return nil }
         switch segment {
-        case .page, .pageImage: return "p. \(Int(loc))"
+        case .page, .pageImage: return L10n.format("p. %1$@", String(describing: Int(loc)))
         case .frame: return Self.clock(loc)
         case .audio: return kind == .video ? "♪ \(Self.clock(loc))" : Self.clock(loc)
         case .lines: return Int(loc) == Int(locEnd ?? loc) ? "L\(Int(loc))" : "L\(Int(loc))–\(Int(locEnd ?? loc))"
@@ -83,8 +87,8 @@ struct ResultRow: Identifiable, Equatable {
         guard let loc else { return nil }
         let (first, last) = (Int(loc), Int(locEnd ?? loc))
         switch segment {
-        case .lines: return first == last ? "line \(first)" : "lines \(first)–\(last)"
-        case .cells: return first == last ? "cell \(first)" : "cells \(first)–\(last)"
+        case .lines: return first == last ? L10n.format("line %1$@", String(describing: first)) : L10n.format("lines %1$@–%2$@", String(describing: first), String(describing: last))
+        case .cells: return first == last ? L10n.format("cell %1$@", String(describing: first)) : L10n.format("cells %1$@–%2$@", String(describing: first), String(describing: last))
         default: return nil
         }
     }
@@ -96,31 +100,32 @@ struct ResultRow: Identifiable, Equatable {
 
     /// Why it's here, in a few words: "Matches the picture", "Matches the frame at 0:06".
     var reason: String {
-        guard matchedMeaning else { return matchedWords ? "Has your words" : "Matches its name" }
+        guard matchedMeaning else { return matchedWords ? L10n.text("Has your words") : L10n.text("Matches its name") }
         let place = loc.map(Self.clock) ?? ""
-        let page = loc.map { "page \(Int($0))" } ?? "a page"
+        let page = loc.map { L10n.format("page %1$@", String(describing: Int($0))) } ?? L10n.text("a page")
         switch segment {
-        case .image: return kind == .screenshot ? "Matches what's on screen" : "Matches the picture"
-        case .ocr: return "Matches the text in it"
-        case .frame: return "Matches the frame at \(place)"
-        case .audio: return kind == .video ? "Matches the sound at \(place)" : "Matches what's heard at \(place)"
-        case .page: return "Matches the text on \(page)"
-        case .pageImage: return "Matches \(page)"
-        case .chunk: return "Matches its text"
-        case .name: return "Matches its name"
-        case .lines, .cells: return "Matches \(span ?? "the code")"
+        case .image: return kind == .screenshot ? L10n.text("Matches what's on screen") : L10n.text("Matches the picture")
+        case .ocr: return L10n.text("Matches the text in it")
+        case .frame: return L10n.format("Matches the frame at %1$@", String(describing: place))
+        case .audio: return kind == .video ? L10n.format("Matches the sound at %1$@", String(describing: place)) : L10n.format("Matches what's heard at %1$@", String(describing: place))
+        case .page: return L10n.format("Matches the text on %1$@", String(describing: page))
+        case .pageImage: return L10n.format("Matches %1$@", String(describing: page))
+        case .chunk: return L10n.text("Matches its text")
+        case .name: return L10n.text("Matches its name")
+        case .lines, .cells: return L10n.format("Matches %1$@", String(describing: span ?? L10n.text("the code")))
         }
     }
 
     /// "Screenshot · Oct 1, 2026 · 1440 × 900 · 2.1 MB", "PDF · … · 463 pages, 120 read so far · 23 MB",
     /// "Python · 63 lines · Oct 1, 2026 · 2 KB"
     var details: String {
+        if isApp { return info["version"].map { "Application · version \($0)" } ?? "Application" }
         if kind == .code {
             var parts = [CodeExtractor.language(of: url.path)]
             if let cells = info["cells"].flatMap(Int.init) {
-                parts.append(cells == 1 ? "1 cell" : "\(cells) cells")
+                parts.append(cells == 1 ? L10n.text("1 cell") : L10n.format("%1$@ cells", String(describing: cells)))
             } else if let lines = info["lines"].flatMap(Int.init) {
-                parts.append(lines == 1 ? "1 line" : "\(lines.formatted()) lines")
+                parts.append(lines == 1 ? L10n.text("1 line") : L10n.format("%1$@ lines", String(describing: lines.formatted())))
             }
             parts.append(modified.formatted(date: .abbreviated, time: .omitted))
             if size > 0 { parts.append(bytes(size)) }
@@ -131,14 +136,17 @@ struct ResultRow: Identifiable, Equatable {
         // A long file still being read (`Indexer.finishLongFiles`): what isn't read yet can't match.
         let readTo = info["read_to"].flatMap(Int.init)
         if let pages = info["pages"].flatMap(Int.init) {
-            parts.append((pages == 1 ? "1 page" : "\(pages) pages") + (readTo.map { ", \($0) read so far" } ?? ""))
+            parts.append((pages == 1 ? L10n.text("1 page") : L10n.format("%1$@ pages", String(describing: pages))) + (readTo.map { L10n.format(", %1$@ read so far", String(describing: $0)) } ?? ""))
         } else if readTo != nil {
-            parts.append("partly read so far")
+            parts.append(L10n.text("partly read so far"))
         }
         if let duration { parts.append(Self.clock(duration)) }
         if size > 0 { parts.append(bytes(size)) }
         return parts.joined(separator: " · ")
     }
+
+    /// "Screenshot", "PDF", "Application": what it is, for VoiceOver.
+    var kindTitle: String { isApp ? "Application" : kind.title }
 
     static func clock(_ seconds: Double) -> String {
         let total = Int(seconds)
@@ -152,6 +160,8 @@ enum ResultGroupKind: CaseIterable {
     case screenshots, images, documents, video, audio
     /// Code search's results (the code index; a search of it never shows anything else).
     case code
+    /// Apps the query names (`AppLauncher`): first in the panel and the window's All results.
+    case apps
 
     /// The kinds of files the main index holds: the window's kind filters, ⌘2 to ⌘6.
     static let files: [ResultGroupKind] = [.screenshots, .images, .documents, .video, .audio]
@@ -169,12 +179,13 @@ enum ResultGroupKind: CaseIterable {
 
     var title: String {
         switch self {
-        case .screenshots: "Screenshots"
-        case .images: "Images"
-        case .documents: "Documents"
-        case .video: "Video"
-        case .audio: "Audio"
-        case .code: "Code"
+        case .screenshots: L10n.text("Screenshots")
+        case .images: L10n.text("Images")
+        case .documents: L10n.text("Documents")
+        case .video: L10n.text("Video")
+        case .audio: L10n.text("Audio")
+        case .code: L10n.text("Code")
+        case .apps: "Applications"
         }
     }
 
@@ -186,6 +197,7 @@ enum ResultGroupKind: CaseIterable {
         case .video: FileKind.video.symbol
         case .audio: FileKind.audio.symbol
         case .code: FileKind.code.symbol
+        case .apps: "square.grid.2x2"
         }
     }
 
@@ -197,6 +209,7 @@ enum ResultGroupKind: CaseIterable {
         case .video: [.video]
         case .audio: [.audio]
         case .code: [.code]
+        case .apps: []
         }
     }
 }
@@ -238,6 +251,16 @@ struct ResultSet: Equatable {
         weaker = hits.dropFirst(strong).map { ResultRow($0, terms: terms) }
     }
 
+    /// The same results with `apps` as the first group, in place of the apps they had.
+    func withApps(_ apps: [ResultRow]) -> ResultSet {
+        var set = self
+        set.groups.removeAll { $0.kind == .apps }
+        set.ranked.removeAll { $0.isApp }
+        set.ranked.insert(contentsOf: apps, at: 0)
+        if !apps.isEmpty { set.groups.insert(ResultGroup(kind: .apps, rows: apps, total: apps.count), at: 0) }
+        return set
+    }
+
     var strongRows: [ResultRow] { groups.flatMap(\.rows) }
     var isEmpty: Bool { groups.isEmpty && weaker.isEmpty }
     var count: Int { strongRows.count + weaker.count }
@@ -246,13 +269,13 @@ struct ResultSet: Equatable {
 extension FileKind {
     var title: String {
         switch self {
-        case .screenshot: "Screenshot"
-        case .image: "Image"
+        case .screenshot: L10n.text("Screenshot")
+        case .image: L10n.text("Image")
         case .pdf: "PDF"
-        case .doc: "Document"
-        case .audio: "Audio"
-        case .video: "Video"
-        case .code: "Code"
+        case .doc: L10n.text("Document")
+        case .audio: L10n.text("Audio")
+        case .video: L10n.text("Video")
+        case .code: L10n.text("Code")
         }
     }
 

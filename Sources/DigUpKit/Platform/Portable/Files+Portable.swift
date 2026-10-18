@@ -24,8 +24,11 @@ extension Rules {
 
     /// `classify` as on macOS, by extension (for files with one, macOS's types come from the extension too).
     static func classify(_ url: URL, values: URLResourceValues?, options: IndexOptions) -> Classification {
+        // Before type sniffing or any content reads, in every indexing mode.
+        if isSecret(url.lastPathComponent) { return .skip("key or password file") }
         let ext = url.pathExtension.lowercased()
         if options.excludedExtensions.contains(ext) { return .skip("excluded type") }
+        if protectedExtensions.contains(ext) { return .skip("copy-protected") }
         // .ts / .mts are usually TypeScript. Only a real transport stream is video.
         if ext == "ts" || ext == "mts" || ext == "m2ts" {
             if isMPEGTransportStream(url) { return .index(.video) }
@@ -61,14 +64,23 @@ enum FileSystem {
         url.hasDirectoryPath && packageExtensions.contains(url.pathExtension.lowercased())
     }
 
-    /// No iCloud here. (OneDrive's Files On-Demand placeholders are a file attribute: `info`, on Windows.)
-    static func isInCloud(_ values: URLResourceValues?) -> Bool { false }
-
     #if os(Windows)
+    static func sanitizeWindowsPath(_ path: String) -> String {
+        var p = path
+        if (p.hasPrefix("/") || p.hasPrefix("\\")), p.count >= 3 {
+            let second = p.index(after: p.startIndex)
+            let third = p.index(after: second)
+            if p[second].isASCII && p[second].isLetter && p[third] == ":" {
+                p.removeFirst()
+            }
+        }
+        return p.replacingOccurrences(of: "/", with: "\\")
+    }
+
     /// The file's own facts, without following a link. OneDrive's Files On-Demand placeholders are `dataless` (their
     /// attributes say the contents would be downloaded on read, or on open), and they're never opened here.
     static func info(of path: String) -> FileInfo? {
-        let native = path.replacingOccurrences(of: "/", with: "\\")
+        let native = sanitizeWindowsPath(path)
         var found = WIN32_FIND_DATAW()
         let search = native.withCString(encodedAs: UTF16.self) {
             FindFirstFileExW($0, FindExInfoBasic, &found, FindExSearchNameMatch, nil, 0)
@@ -180,7 +192,7 @@ final class DirectoryWalk {
     private func contents(of folder: URL) -> [URL] {
         // Even asking Foundation only for directory/hidden flags reads the file size internally and can
         // trap when its low DWORD does not fit Int32 (swift-foundation#2096). Keep the whole walk native.
-        let pattern = folder.path.replacingOccurrences(of: "/", with: "\\") + "\\*"
+        let pattern = FileSystem.sanitizeWindowsPath(folder.path) + "\\*"
         var found = WIN32_FIND_DATAW()
         let search = pattern.withCString(encodedAs: UTF16.self) {
             FindFirstFileExW($0, FindExInfoBasic, &found, FindExSearchNameMatch, nil, 0)

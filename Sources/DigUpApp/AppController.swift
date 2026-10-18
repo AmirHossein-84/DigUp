@@ -1,3 +1,4 @@
+import DigUpLocalization
 import AppKit
 import DigUpKit
 import ServiceManagement
@@ -59,6 +60,10 @@ final class AppController {
     func start(showWindow: Bool = false) {
         panel = SearchPanelController(app: self)
         searchWindow = SearchWindowController(app: self)
+        AppLauncher.shared.onChange = { [weak self] in
+            self?.panel.appsChanged()
+            self?.searchWindow.search.appsChanged()
+        }
         settingsWindow = SettingsWindowController(app: self)
         statusMenu = StatusMenuController(model: model)
         statusMenu.onSearch = { [weak self] in self?.panel.show() }
@@ -144,9 +149,14 @@ final class AppController {
     }
 
     func setExcluded(_ folders: [URL]) {
-        AppSettings.save(excludedFolders: folders)
-        model.settings.excludedFolders = folders
-        engine.setFolders(roots: model.settings.roots, excluded: folders, excludedTypes: model.settings.excludedTypes)
+        // Normalize like `applyFolders`: paths go through `AppSettings.folderURL` and `FolderSelection` drops a
+        // skip with nothing around it to skip from, so both save paths agree.
+        let selection = FolderSelection(chosen: model.settings.roots.map { AppSettings.folderURL($0.path).path },
+                                        skipped: folders.map(\.path))
+        let excluded = selection.effectiveSkips.map(AppSettings.folderURL)
+        AppSettings.save(excludedFolders: excluded)
+        model.settings.excludedFolders = excluded
+        engine.setFolders(roots: model.settings.roots, excluded: excluded, excludedTypes: model.settings.excludedTypes)
     }
 
     /// File extensions never to index ("heic, .txt"); files of those types already indexed leave the index.
@@ -202,14 +212,14 @@ final class AppController {
     }
 
     /// Asks for folders with the standard open panel (as a sheet when there's a window).
-    func pickFolders(for window: NSWindow?, prompt: String = "Add", then done: @escaping ([URL]) -> Void) {
+    func pickFolders(for window: NSWindow?, prompt: String = L10n.text("Add"), then done: @escaping ([URL]) -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         panel.canCreateDirectories = false
         panel.prompt = prompt
-        panel.message = "Choose folders for DigUp to search."
+        panel.message = L10n.text("Choose folders for DigUp to search.")
         let finish = { (response: NSApplication.ModalResponse) in
             done(response == .OK ? panel.urls.map { AppSettings.folderURL($0.path) } : [])
         }
@@ -234,7 +244,7 @@ final class AppController {
     /// Nil when `combo` is now the hotkey, else why it can't be.
     func setHotkey(_ combo: KeyCombo) -> String? {
         if let conflict = combo.systemConflict { return conflict }
-        guard hotkeys.register(combo) else { return "Another app is using \(combo.display)" }
+        guard hotkeys.register(combo) else { return L10n.format("Another app is using %1$@", String(describing: combo.display)) }
         AppSettings.save(hotkey: combo.spec)
         model.settings.hotkey = combo.spec
         model.hotkey = combo

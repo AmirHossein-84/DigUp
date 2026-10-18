@@ -1,3 +1,4 @@
+import DigUpLocalization
 import AVFoundation
 import AppKit
 import DigUpKit
@@ -145,7 +146,7 @@ struct PreviewPane: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .help("Show in Finder")
+                .help(L10n.text("Show in Finder"))
                 Text(row.details)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -170,7 +171,7 @@ struct PreviewActions: View {
         HStack(spacing: 8) {
             Button(row.openTitle, action: open)
                 .keyboardShortcut(.defaultAction)
-            Button("Show in Finder", action: reveal)
+            Button(L10n.text("Show in Finder"), action: reveal)
         }
         .controlSize(controlSize)
     }
@@ -200,6 +201,13 @@ struct PreviewPicture: View {
                 Passage(row: row)
                     .frame(maxWidth: size.width, maxHeight: size.height)
                     .onTapGesture(count: 2, perform: open)
+            } else if row.isApp {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: row.iconURL.path))
+                    .resizable()
+                    .frame(width: 128, height: 128)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2, perform: open)
+                    .frame(maxWidth: size.width, maxHeight: size.height)
             } else if row.moment != nil, let player = PreviewPlayback.shared.player,
                       PreviewPlayback.shared.isCurrent(row) {
                 PlayerView(player: player)
@@ -239,7 +247,7 @@ struct PreviewPicture: View {
         // without its controls.
         .onDisappear { if PreviewPlayback.shared.isCurrent(row) { PreviewPlayback.shared.stop() } }
         .task(id: Previews.shared.key(row, max(size.width, size.height))) {
-            guard row.segment != .chunk, row.kind != .code else { return }
+            guard row.segment != .chunk, row.kind != .code, !row.isApp else { return }
             let side = max(size.width, size.height)
             image = Previews.shared.cached(row, side: side)
             loaded = image != nil
@@ -288,7 +296,7 @@ struct AudioMoment: View {
                         .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
-                .help(row.loc.map { "Play from \(ResultRow.clock($0))" } ?? "Play")
+                .help(row.loc.map { L10n.format("Play from %1$@", String(describing: ResultRow.clock($0))) } ?? L10n.text("Play"))
             }
             if let loc = row.loc {
                 VStack(spacing: 5) {
@@ -297,7 +305,7 @@ struct AudioMoment: View {
                                   playhead: playback.isCurrent(row) ? playback.time : nil)
                             .frame(maxWidth: 260)
                     }
-                    Text(playback.isCurrent(row) ? "\(ResultRow.clock(playback.time)) – playing from "
+                    Text(playback.isCurrent(row) ? L10n.format("%1$@ – playing from ", String(describing: ResultRow.clock(playback.time)))
                          + ResultRow.clock(loc) : span(from: loc))
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -311,7 +319,7 @@ struct AudioMoment: View {
     /// "0:25 – 0:55 of 3:12"
     private func span(from start: Double) -> String {
         let end = row.locEnd ?? start + 30
-        let total = row.duration.map { " of " + ResultRow.clock($0) } ?? ""
+        let total = row.duration.map { L10n.text(" of ") + ResultRow.clock($0) } ?? ""
         return ResultRow.clock(start) + " – " + ResultRow.clock(end) + total
     }
 }
@@ -356,8 +364,8 @@ struct PlayButton: View {
                 .overlay(Circle().strokeBorder(.white.opacity(0.7), lineWidth: 1.5))
         }
         .buttonStyle(.plain)
-        .help(row.moment.map { "Play from \(ResultRow.clock($0))" } ?? "Play")
-        .accessibilityLabel(row.moment.map { "Play from \(ResultRow.clock($0))" } ?? "Play")
+        .help(row.moment.map { L10n.format("Play from %1$@", String(describing: ResultRow.clock($0))) } ?? L10n.text("Play"))
+        .accessibilityLabel(row.moment.map { L10n.format("Play from %1$@", String(describing: ResultRow.clock($0))) } ?? L10n.text("Play"))
     }
 }
 
@@ -394,7 +402,7 @@ struct Passage: View {
         guard let part = row.loc.map(Int.init), let parts = row.info["chunks"].flatMap(Int.init), parts > 1 else {
             return nil
         }
-        return "Part \(part) of \(parts)"
+        return L10n.format("Part %1$@ of %2$@", String(describing: part), String(describing: parts))
     }
 
     /// Up to ~900 characters from just before the first marked word, the words marked like a search in Preview.

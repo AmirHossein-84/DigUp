@@ -30,6 +30,20 @@ import Testing
         #expect(Rules.classify(file, values: nil, options: options) == .index(.doc))
     }
 
+    @Test func secretsAreExcludedInEveryMode() {
+        for name in ["passwords.txt", "Password.docx", "secrets.md", "credentials.yaml", "prod.pem",
+                     "id_rsa", ".env.local", "passwords.ts", "secret-photo.jpg"] {
+            let url = folder.appendingPathComponent(name)
+            for includeCode in [false, true] {
+                var options = IndexOptions()
+                options.includeCode = includeCode
+                #expect(Rules.classify(url, values: nil, options: options) == .skip("key or password file"))
+                options.code = true
+                #expect(Rules.classifyCode(url, options: options) == .skip("key or password file"))
+            }
+        }
+    }
+
     @Test func machineNames() {
         #expect(Rules.looksMachineNamed("clip_000123"))
         #expect(Rules.looksMachineNamed("frame-0042"))
@@ -137,6 +151,49 @@ import Testing
         try Data("notes about the trip".utf8).write(to: inner.appendingPathComponent("trip.txt"))
         let report = Crawler.crawl([folder, inner], options: IndexOptions())
         #expect(report.candidates.map { ($0.path as NSString).lastPathComponent } == ["trip.txt"])
+    }
+
+    @Test func changesCountOnlyForWhatCouldBeIndexed() throws {
+        func matters(_ path: String, folder: Bool = false, skipping types: Set<String> = []) -> Bool {
+            Rules.changeMayMatter(path, isFolder: folder, excludedExtensions: types)
+        }
+        #expect(matters("/Users/me/Desktop/trip.pdf"))
+        #expect(matters("/Users/me/Pictures/beach.heic"))
+        #expect(matters("/Users/me/Documents/notes.md"))
+        #expect(matters("/Users/me/Desktop/New Folder", folder: true))
+        // A database on the Desktop rewrote these every 10 s, and each asked for a sync of every folder.
+        #expect(!matters("/Users/me/Desktop/LibreChat/data-node/WiredTiger.turtle.set"))
+        #expect(!matters("/Users/me/Desktop/LibreChat/data-node/diagnostic.data/metrics.interim.temp"))
+        #expect(!matters("/Users/me/Desktop/LibreChat/data-node/collection-0.wt"))
+        #expect(!matters("/Users/me/Downloads/app/server.log"))
+        // Inside a bundle the crawl skips whole (Photos' own library).
+        let library = folder.appendingPathComponent("Photos Library.photoslibrary")
+        try FileManager.default.createDirectory(at: library.appendingPathComponent("database"),
+                                                withIntermediateDirectories: true)
+        #expect(!matters(library.path + "/originals/A/IMG_1.heic"))
+        #expect(!matters(library.path + "/database", folder: true))
+        #expect(!matters("/Users/me/Desktop/trip.pdf", skipping: ["pdf"]))
+    }
+
+    /// A File Provider (iCloud Drive, Google Drive…) answers these with a round trip per entry: a sync over a few hundred
+    /// thousand of them took ten minutes. A file that isn't downloaded is `dataless` instead.
+    @Test func crawlDoesNotAskFileProvidersAboutEachEntry() {
+        #if os(macOS)
+        let keys = Set(FileSystem.crawlKeys)
+        #expect(!keys.contains(.isUbiquitousItemKey))
+        #expect(!keys.contains(.ubiquitousItemDownloadingStatusKey))
+        #endif
+    }
+
+    /// Apple Music downloads and old iTunes Store songs are FairPlay-protected: they'd only ever fail to read.
+    @Test func copyProtectedMusicIsSkipped() throws {
+        for name in ["Bought in 2007.m4p", "Ripped from a CD.m4a"] {
+            try Data(count: 1024).write(to: folder.appendingPathComponent(name))
+        }
+        let report = Crawler.crawl([folder], options: IndexOptions())
+        #expect(report.candidates.map { ($0.path as NSString).lastPathComponent } == ["Ripped from a CD.m4a"])
+        #expect(report.candidates.first?.kind == .audio)
+        #expect(report.skipped["copy-protected"] == 1)
     }
 
     @Test func changesCountOnlyWhereTheCrawlGoes() {
