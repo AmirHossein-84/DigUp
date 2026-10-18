@@ -171,6 +171,7 @@ final class SearchPanelController {
         let codeText = CodeQuery.text(of: typed)
         isCode = codeText != nil
         let code = isCode
+        let text = codeText ?? typed
         apps = []
         guard !typed.isEmpty else {
             results = .empty
